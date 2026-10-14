@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Untitled - Typora RS</title>
+    <link rel="stylesheet" href="./style.css" />
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <header class="app-menu" role="menubar" aria-label="应用菜单">
+      <button class="menu-trigger" data-menu="file" aria-haspopup="true">File</button>
+      <button class="menu-trigger" data-menu="edit" aria-haspopup="true">Edit</button>
+      <button class="menu-trigger" data-menu="paragraph" aria-haspopup="true">Paragraph</button>
+      <button class="menu-trigger" data-menu="format" aria-haspopup="true">Format</button>
+      <button class="menu-trigger" data-menu="view" aria-haspopup="true">View</button>
+      <button class="menu-trigger" data-menu="theme" aria-haspopup="true">Theme</button>
+      <button class="menu-trigger" data-menu="help" aria-haspopup="true">Help</button>
+
+      <div class="menu-popup" id="menu-file" role="menu" hidden>
+        <button role="menuitem" data-action="open">Open… <span>Ctrl+O</span></button>
+        <button role="menuitem" data-action="save">Save <span>Ctrl+S</span></button>
+        <button role="menuitem" data-action="save-as">Save As…</button>
+        <hr />
+        <button role="menuitem" data-action="export-html">Export <span>HTML</span></button>
+      </div>
+      <div class="menu-popup" id="menu-edit" role="menu" hidden>
+        <button role="menuitem" data-action="undo">Undo <span>Ctrl+Z</span></button>
+        <button role="menuitem" data-action="redo">Redo <span>Ctrl+Y</span></button>
+        <hr />
+        <button role="menuitem" data-action="find">Find… <span>Ctrl+F</span></button>
+        <button role="menuitem" data-action="select-all">Select All <span>Ctrl+A</span></button>
+      </div>
+      <div class="menu-popup" id="menu-paragraph" role="menu" hidden>
+        <button role="menuitem" data-action="heading" data-level="1">Heading 1 <span>Ctrl+Alt+1</span></button>
+        <button role="menuitem" data-action="heading" data-level="2">Heading 2 <span>Ctrl+Alt+2</span></button>
+        <button role="menuitem" data-action="heading" data-level="3">Heading 3 <span>Ctrl+Alt+3</span></button>
+        <button role="menuitem" data-action="paragraph">Paragraph</button>
+        <hr />
+        <button role="menuitem" data-action="unordered-list">Unordered List</button>
+        <button role="menuitem" data-action="ordered-list">Ordered List</button>
+        <button role="menuitem" data-action="quote">Block Quote</button>
+        <button role="menuitem" data-action="code-block">Code Fences</button>
+        <button role="menuitem" data-action="table">Table…</button>
+      </div>
+      <div class="menu-popup" id="menu-format" role="menu" hidden>
+        <button role="menuitem" data-action="bold">Strong <span>Ctrl+B</span></button>
+        <button role="menuitem" data-action="italic">Emphasis <span>Ctrl+I</span></button>
+        <button role="menuitem" data-action="strike">Strikethrough</button>
+        <button role="menuitem" data-action="inline-code">Inline Code</button>
+        <button role="menuitem" data-action="link">Link… <span>Ctrl+K</span></button>
+        <button role="menuitem" data-action="image">Image…</button>
+      </div>
+      <div class="menu-popup" id="menu-view" role="menu" hidden>
+        <button role="menuitem" data-action="outline">Show Outline Panel <span>Ctrl+Shift+O</span></button>
+        <button role="menuitem" data-action="files">Show File Panel</button>
+        <button role="menuitem" data-action="status-bar">Show Status Bar</button>
+        <hr />
+        <button role="menuitem" data-action="source">Source Code Mode <span>Ctrl+/</span></button>
+        <button role="menuitem" data-action="focus">Focus Mode <span>Ctrl+Shift+0</span></button>
+        <button role="menuitem" data-action="typewriter">Typewriter Mode <span>Ctrl+Shift+T</span></button>
+        <button role="menuitem" data-action="word-count">Word Count</button>
+        <hr />
+        <button role="menuitem" data-action="fullscreen">Toggle Fullscreen <span>F11</span></button>
+        <button role="menuitem" data-action="zoom-in">Zoom In <span>Ctrl+Shift+=</span></button>
+        <button role="menuitem" data-action="zoom-out">Zoom Out <span>Ctrl+Shift+-</span></button>
+        <button role="menuitem" data-action="zoom-reset">Actual Size <span>Ctrl+0</span></button>
+      </div>
+      <div class="menu-popup" id="menu-theme" role="menu" hidden>
+        <button role="menuitem" data-theme="github">GitHub</button>
+        <button role="menuitem" data-theme="newsprint">Newsprint</button>
+        <button role="menuitem" data-theme="night">Night</button>
+      </div>
+      <div class="menu-popup menu-popup-right" id="menu-help" role="menu" hidden>
+        <button role="menuitem" data-action="about">关于 Typora RS</button>
+        <button role="menuitem" data-action="shortcuts">快捷键</button>
+      </div>
+    </header>
+
+    <div class="workspace">
+      <aside id="sidebar" class="sidebar" hidden>
+        <div class="sidebar-tabs">
+          <button class="sidebar-tab selected" data-panel="outline">Outline</button>
+          <button class="sidebar-tab" data-panel="files">Files</button>
+          <button id="close-sidebar" class="sidebar-close" aria-label="关闭侧栏">×</button>
+        </div>
+        <section id="outline-panel" class="sidebar-panel">
+          <div id="outline" class="outline"><div class="sidebar-empty">Headings will appear here</div></div>
+        </section>
+        <section id="files-panel" class="sidebar-panel" hidden>
+          <div class="file-panel-top"><button id="open-folder">Open Folder…</button></div>
+          <div class="sidebar-empty">Open a folder to browse Markdown documents</div>
+        </section>
+      </aside>
+
+      <main id="main-area" class="main-area">
+        <div id="editor" class="document" contenteditable="true" spellcheck="false" aria-label="Markdown document" role="textbox" aria-multiline="true"></div>
+        <textarea id="source" class="source-editor" aria-label="Markdown source" spellcheck="false" hidden></textarea>
+      </main>
+    </div>
+
+    <div id="findbar" class="findbar" hidden>
+      <input id="find-input" type="search" placeholder="查找" aria-label="查找文本" />
+      <span id="find-count"></span>
+      <button id="find-prev" title="上一个">↑</button>
+      <button id="find-next" title="下一个">↓</button>
+      <button id="find-close" title="关闭">×</button>
+    </div>
+
+    <div id="word-popover" class="word-popover" hidden></div>
+
+    <footer class="statusbar">
+      <div class="status-left">
+        <button id="toggle-sidebar" class="status-icon" title="切换侧栏">☷</button>
+        <button id="toggle-source" class="source-toggle" title="源码模式 (Ctrl+/)">&lt;/&gt;</button>
+      </div>
+      <div id="status-center" class="status-center"></div>
+      <button id="word-count" class="word-count" title="Show word count">0 Words</button>
+    </footer>
+  </body>
+</html>

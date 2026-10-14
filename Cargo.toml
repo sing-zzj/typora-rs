@@ -1,0 +1,25 @@
+[package]
+name = "typora-rs"
+version = "0.1.0"
+edition = "2024"
+description = "A local-first Markdown editor built with Rust and Tauri"
+license = "MIT"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+ammonia = "4.2"
+base64 = "0.22"
+percent-encoding = "2"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = [] }
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

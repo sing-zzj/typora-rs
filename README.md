@@ -8,9 +8,13 @@ A local-first Markdown editor built with Rust and Tauri, inspired by the calm, l
 - Typora-inspired File, Edit, Paragraph, Format, View, Theme, and Help menus.
 - Open, edit, save, and save-as Markdown documents; atomic saves retain LF/CRLF line endings.
 - Outline and folder sidebars, word count, find, focus mode, and typewriter mode.
+- Local recovery drafts are saved while editing and can be restored after an unexpected close; a successful save clears the recovery copy.
 - Markdown headings, lists, quotes, code blocks, tables, images, links, and inline formatting.
-- Table, task list, strikethrough, and footnote rendering. Local images are copied into a sibling `.assets` folder.
-- HTML export and raw-HTML-as-text rendering for local documents.
+- Table row and column insertion/removal, column alignment, Tab navigation, and row insertion with Ctrl+Enter.
+- Task lists, strikethrough, footnotes, inline/display math (KaTeX), and Mermaid diagrams. Their renderer assets are bundled for offline use.
+- Local images are copied into a sibling `.assets` folder. HTML export embeds math fonts and rendered diagrams.
+- Print and PDF output through the Windows print dialog.
+- Raw HTML is sanitized before preview.
 
 ## Run
 

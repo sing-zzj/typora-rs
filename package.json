@@ -1,0 +1,24 @@
+{
+  "name": "typora-rs-renderers",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A local-first Markdown editor built with Rust and Tauri, inspired by the calm, live-preview writing experience of Typora.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sing-zzj/typora-rs.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/sing-zzj/typora-rs/issues"
+  },
+  "homepage": "https://github.com/sing-zzj/typora-rs#readme",
+  "dependencies": {
+    "@highlightjs/cdn-assets": "11.12.0",
+    "highlight.js": "11.12.0",
+    "katex": "0.19.0",
+    "mermaid": "12.2.0"
+  }
+}

@@ -3,15 +3,14 @@ use std::{fs, io::Write, path::PathBuf, sync::Mutex};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd, html};
-use serde::Serialize;
-use tauri::State;
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Manager, State};
 
 #[derive(Default)]
 struct EditorState {
     current_path: Mutex<Option<PathBuf>>,
     current_folder: Mutex<Option<PathBuf>>,
 }
-
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Document {
@@ -62,7 +61,63 @@ struct FolderEntry {
 #[serde(rename_all = "camelCase")]
 struct FolderListing {
     path: String,
+    root_path: String,
     entries: Vec<FolderEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryDraft {
+    content: String,
+    path: Option<String>,
+    line_ending: String,
+}
+
+#[tauri::command]
+fn save_recovery_draft(
+    app: AppHandle,
+    content: String,
+    path: Option<String>,
+    line_ending: String,
+) -> Result<(), String> {
+    let recovery_path = recovery_path(&app)?;
+    fs::create_dir_all(recovery_path.parent().expect("app data path has parent"))
+        .map_err(|error| format!("无法创建草稿恢复目录：{error}"))?;
+    let draft = RecoveryDraft {
+        content,
+        path,
+        line_ending,
+    };
+    let bytes = serde_json::to_vec(&draft).map_err(|error| format!("无法编码恢复草稿：{error}"))?;
+    atomic_write(&recovery_path, &bytes).map_err(|error| format!("无法暂存恢复草稿：{error}"))
+}
+
+#[tauri::command]
+fn load_recovery_draft(app: AppHandle) -> Result<Option<RecoveryDraft>, String> {
+    let path = recovery_path(&app)?;
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| format!("恢复草稿格式无效：{error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("无法读取恢复草稿：{error}")),
+    }
+}
+
+#[tauri::command]
+fn clear_recovery_draft(app: AppHandle) -> Result<(), String> {
+    match fs::remove_file(recovery_path(&app)?) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("无法清除恢复草稿：{error}")),
+    }
+}
+
+fn recovery_path(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|directory| directory.join("recovery-draft.json"))
+        .map_err(|error| format!("无法定位应用数据目录：{error}"))
 }
 
 #[tauri::command]
@@ -84,7 +139,7 @@ fn load_document(path: PathBuf, state: &EditorState) -> Result<Document, String>
         .current_path
         .lock()
         .map_err(|_| "文档状态不可用".to_owned())? = Some(path.clone());
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = canonical_parent(&path) {
         *state
             .current_folder
             .lock()
@@ -169,6 +224,7 @@ fn read_folder_entries(root: PathBuf, path: PathBuf) -> Result<FolderListing, St
     });
     Ok(FolderListing {
         path: path.to_string_lossy().into_owned(),
+        root_path: root.to_string_lossy().into_owned(),
         entries,
     })
 }
@@ -222,7 +278,7 @@ fn save_document(
         .current_path
         .lock()
         .map_err(|_| "文档状态不可用".to_owned())? = Some(path.clone());
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = canonical_parent(&path) {
         *state
             .current_folder
             .lock()
@@ -230,6 +286,14 @@ fn save_document(
     }
 
     Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+fn canonical_parent(path: &std::path::Path) -> Option<PathBuf> {
+    path.parent().map(|parent| {
+        parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf())
+    })
 }
 
 fn normalize_line_endings(source: &str, line_ending: &str) -> String {
@@ -343,7 +407,7 @@ fn image_mime(extension: &str) -> &'static str {
 }
 
 #[tauri::command]
-fn export_html(html: String) -> Result<Option<String>, String> {
+fn export_html(html: String, styles: String) -> Result<Option<String>, String> {
     let Some(path) = rfd::FileDialog::new()
         .add_filter("HTML", &["html", "htm"])
         .set_file_name("document.html")
@@ -352,7 +416,7 @@ fn export_html(html: String) -> Result<Option<String>, String> {
         return Ok(None);
     };
     let document = format!(
-        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Markdown Export</title><style>body{{max-width:860px;margin:48px auto;padding:0 24px;color:#24292f;font:16px/1.75 Arial,'Microsoft YaHei UI',sans-serif}}img{{max-width:100%}}pre,code{{font-family:Consolas,monospace}}pre{{padding:16px;background:#f6f8fa;border-radius:6px;overflow:auto}}code{{padding:.2em .4em;background:#eff1f3;border-radius:4px}}table{{border-collapse:collapse}}th,td{{padding:6px 12px;border:1px solid #d0d7de}}blockquote{{border-left:4px solid #d0d7de;padding-left:16px;color:#57606a}}a{{color:#0969da}}</style></head><body>{html}</body></html>"
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Markdown Export</title><style>{styles}</style></head><body>{html}</body></html>"
     );
     atomic_write(&path, document.as_bytes()).map_err(|error| format!("无法导出 HTML：{error}"))?;
     Ok(Some(path.to_string_lossy().into_owned()))
@@ -364,8 +428,18 @@ fn render_markdown_blocking(source: String, document_path: Option<String>) -> Re
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
     options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_MATH);
+    options.insert(Options::ENABLE_GFM);
+    options.insert(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
+    options.insert(Options::ENABLE_DEFINITION_LIST);
+    options.insert(Options::ENABLE_SUPERSCRIPT);
+    options.insert(Options::ENABLE_SUBSCRIPT);
+    options.insert(Options::ENABLE_HEADING_ATTRIBUTES);
 
-    let parser = Parser::new_ext(&source, options);
+    // Keep YAML front matter out of the Markdown body. The frontend retains
+    // the original block separately so editing and saving does not lose it.
+    let body = markdown_body(&source);
+    let parser = Parser::new_ext(body, options);
     let mut safe_events = Vec::new();
     let mut headings = Vec::new();
     let mut images = Vec::new();
@@ -376,21 +450,37 @@ fn render_markdown_blocking(source: String, document_path: Option<String>) -> Re
         image_marker_prefix.push('x');
     }
     let mut active_heading: Option<Heading> = None;
+    let mut in_code_block = false;
 
     for event in parser {
         match event {
-            Event::Start(Tag::Heading { level, .. }) => {
+            Event::Start(tag @ Tag::CodeBlock(_)) => {
+                in_code_block = true;
+                safe_events.push(Event::Start(tag));
+            }
+            Event::End(end @ TagEnd::CodeBlock) => {
+                in_code_block = false;
+                safe_events.push(Event::End(end));
+            }
+            Event::Start(tag @ Tag::Heading { level, .. }) => {
                 active_heading = Some(Heading {
                     level: heading_level(level),
                     text: String::new(),
                 });
+                safe_events.push(Event::Start(tag));
             }
-            Event::End(TagEnd::Heading(_)) => {
+            Event::End(end @ TagEnd::Heading(_)) => {
                 if let Some(heading) = active_heading.take() {
                     headings.push(heading);
                 }
+                safe_events.push(Event::End(end));
             }
             Event::Text(text) => {
+                let text = if in_code_block {
+                    text
+                } else {
+                    replace_emoji_shortcodes(&text).into()
+                };
                 if let Some(heading) = active_heading.as_mut() {
                     heading.text.push_str(&text);
                 }
@@ -466,6 +556,65 @@ fn render_markdown_blocking(source: String, document_path: Option<String>) -> Re
     }
 }
 
+fn markdown_body(source: &str) -> &str {
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
+    let Some(opening_end) = source.find('\n') else {
+        return source;
+    };
+    if source[..opening_end].trim_end_matches('\r') != "---" {
+        return source;
+    }
+
+    let mut line_start = opening_end + 1;
+    while line_start <= source.len() {
+        let line_end = source[line_start..]
+            .find('\n')
+            .map(|offset| line_start + offset)
+            .unwrap_or(source.len());
+        let line = source[line_start..line_end].trim_end_matches('\r');
+        if line == "---" || line == "..." {
+            return if line_end < source.len() {
+                &source[line_end + 1..]
+            } else {
+                &source[line_end..]
+            };
+        }
+        if line_end == source.len() {
+            break;
+        }
+        line_start = line_end + 1;
+    }
+    source
+}
+
+fn replace_emoji_shortcodes(text: &str) -> String {
+    if !text.contains(':') {
+        return text.to_owned();
+    }
+    [
+        (":smile:", "😄"),
+        (":heart:", "❤️"),
+        (":rocket:", "🚀"),
+        (":tada:", "🎉"),
+        (":fire:", "🔥"),
+        (":sparkles:", "✨"),
+        (":thumbsup:", "👍"),
+        (":warning:", "⚠️"),
+        (":bulb:", "💡"),
+        (":memo:", "📝"),
+        (":cn:", "🇨🇳"),
+        (":us:", "🇺🇸"),
+        (":jp:", "🇯🇵"),
+        (":kr:", "🇰🇷"),
+        (":de:", "🇩🇪"),
+        (":fr:", "🇫🇷"),
+    ]
+    .iter()
+    .fold(text.to_owned(), |value, (shortcode, emoji)| {
+        value.replace(shortcode, emoji)
+    })
+}
+
 fn sanitize_html(source: &str) -> String {
     // Code-fence language classes come from Markdown metadata. Preserve their
     // values so themes and syntax-highlighting extensions can recognize them.
@@ -489,10 +638,18 @@ fn sanitize_html(source: &str) -> String {
     let code_class_refs: Vec<&str> = code_classes.iter().map(String::as_str).collect();
     let mut sanitizer = ammonia::Builder::default();
     let mut allowed_tags = sanitizer.clone_tags();
+    allowed_tags.extend(["h1", "h2", "h3", "h4", "h5", "h6"]);
     allowed_tags.insert("input");
     sanitizer.tags(allowed_tags);
     sanitizer.add_allowed_classes("code", &code_class_refs);
     sanitizer.add_allowed_classes("pre", &code_class_refs);
+    sanitizer.add_allowed_classes("span", &code_class_refs);
+    sanitizer.add_allowed_classes("p", &code_class_refs);
+    sanitizer.add_allowed_classes("blockquote", &code_class_refs);
+    for tag in ["h1", "h2", "h3", "h4", "h5", "h6"] {
+        sanitizer.add_allowed_classes(tag, &code_class_refs);
+        sanitizer.add_tag_attributes(tag, &["id"]);
+    }
     sanitizer.url_relative(ammonia::UrlRelative::PassThrough);
     sanitizer.add_tag_attributes("input", &["type", "checked", "disabled"]);
     sanitizer.add_tag_attribute_values("input", "type", &["checkbox"]);
@@ -574,6 +731,9 @@ pub fn run() {
             list_folder,
             open_document_by_path,
             save_document,
+            save_recovery_draft,
+            load_recovery_draft,
+            clear_recovery_draft,
             render_markdown,
             export_html,
             import_image

@@ -28,3 +28,4 @@ rustc-ice-*.txt
 
 /target
 /gen/schemas
+/node_modules

@@ -4,7 +4,13 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Untitled - Typora RS</title>
+    <link rel="stylesheet" href="./vendor/katex/katex.min.css" />
+    <link id="highlight-light" rel="stylesheet" href="./vendor/highlight/github.min.css" />
+    <link id="highlight-dark" rel="stylesheet" href="./vendor/highlight/github-dark.min.css" disabled />
     <link rel="stylesheet" href="./style.css" />
+    <script src="./vendor/katex/katex.min.js" defer></script>
+    <script src="./vendor/mermaid/mermaid.min.js" defer></script>
+    <script src="./vendor/highlight/highlight.min.js" defer></script>
     <script src="./app.js" defer></script>
   </head>
   <body>
@@ -23,12 +29,14 @@
         <button role="menuitem" data-action="save-as">Save As…</button>
         <hr />
         <button role="menuitem" data-action="export-html">Export <span>HTML</span></button>
+        <button role="menuitem" data-action="export-pdf">Print / Export PDF…</button>
       </div>
       <div class="menu-popup" id="menu-edit" role="menu" hidden>
         <button role="menuitem" data-action="undo">Undo <span>Ctrl+Z</span></button>
         <button role="menuitem" data-action="redo">Redo <span>Ctrl+Y</span></button>
         <hr />
         <button role="menuitem" data-action="find">Find… <span>Ctrl+F</span></button>
+        <button role="menuitem" data-action="replace">Find and Replace… <span>Ctrl+H</span></button>
         <button role="menuitem" data-action="select-all">Select All <span>Ctrl+A</span></button>
       </div>
       <div class="menu-popup" id="menu-paragraph" role="menu" hidden>
@@ -42,6 +50,14 @@
         <button role="menuitem" data-action="quote">Block Quote</button>
         <button role="menuitem" data-action="code-block">Code Fences</button>
         <button role="menuitem" data-action="table">Table…</button>
+        <hr />
+        <button role="menuitem" data-action="table-add-row">Add Row <span>Ctrl+Enter</span></button>
+        <button role="menuitem" data-action="table-add-column">Add Column</button>
+        <button role="menuitem" data-action="table-delete-row">Delete Row</button>
+        <button role="menuitem" data-action="table-delete-column">Delete Column</button>
+        <button role="menuitem" data-action="table-align-left">Align Column Left</button>
+        <button role="menuitem" data-action="table-align-center">Align Column Center</button>
+        <button role="menuitem" data-action="table-align-right">Align Column Right</button>
       </div>
       <div class="menu-popup" id="menu-format" role="menu" hidden>
         <button role="menuitem" data-action="bold">Strong <span>Ctrl+B</span></button>
@@ -88,7 +104,16 @@
           <div id="outline" class="outline"><div class="sidebar-empty">Headings will appear here</div></div>
         </section>
         <section id="files-panel" class="sidebar-panel" hidden>
-          <div class="file-panel-top"><button id="open-folder">Open Folder…</button></div>
+          <div class="file-panel-top">
+            <div class="file-panel-actions">
+              <button id="open-folder" class="open-folder-button">打开文件夹…</button>
+              <button id="folder-up" title="返回上级目录" aria-label="返回上级目录">↑</button>
+              <button id="folder-refresh" title="刷新目录" aria-label="刷新目录">↻</button>
+              <button id="folder-copy" title="复制完整路径" aria-label="复制完整路径">⧉</button>
+            </div>
+            <div id="folder-location" class="folder-location"></div>
+            <input id="file-filter" class="file-filter" type="search" placeholder="筛选文件…" aria-label="筛选文件" />
+          </div>
           <div class="sidebar-empty">Open a folder to browse Markdown documents</div>
         </section>
       </aside>
@@ -99,12 +124,29 @@
       </main>
     </div>
 
+    <div id="table-toolbar" class="table-toolbar" hidden aria-label="Table editing">
+      <button data-table-action="add-row" title="Add row">＋ Row</button>
+      <button data-table-action="add-column" title="Add column">＋ Col</button>
+      <button data-table-action="delete-row" title="Delete row">− Row</button>
+      <button data-table-action="delete-column" title="Delete column">− Col</button>
+      <span></span>
+      <button data-table-action="align-left" title="Align left">↤</button>
+      <button data-table-action="align-center" title="Align center">↔</button>
+      <button data-table-action="align-right" title="Align right">↦</button>
+    </div>
+
     <div id="findbar" class="findbar" hidden>
       <input id="find-input" type="search" placeholder="查找" aria-label="查找文本" />
       <span id="find-count"></span>
       <button id="find-prev" title="上一个">↑</button>
       <button id="find-next" title="下一个">↓</button>
+      <button id="replace-toggle" title="显示替换">Replace</button>
       <button id="find-close" title="关闭">×</button>
+      <div id="replace-row" class="replace-row" hidden>
+        <input id="replace-input" type="text" placeholder="替换为" aria-label="替换为" />
+        <button id="replace-current">Replace</button>
+        <button id="replace-all">Replace All</button>
+      </div>
     </div>
 
     <div id="word-popover" class="word-popover" hidden></div>

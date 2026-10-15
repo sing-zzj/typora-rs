@@ -30,6 +30,8 @@
         <hr />
         <button role="menuitem" data-action="export-html">Export <span>HTML</span></button>
         <button role="menuitem" data-action="export-pdf">Print / Export PDF…</button>
+        <hr />
+        <button role="menuitem" data-action="preferences">Preferences… <span>Ctrl+,</span></button>
       </div>
       <div class="menu-popup" id="menu-edit" role="menu" hidden>
         <button role="menuitem" data-action="undo">Undo <span>Ctrl+Z</span></button>
@@ -92,6 +94,80 @@
         <button role="menuitem" data-action="shortcuts">快捷键</button>
       </div>
     </header>
+
+    <div id="preferences-dialog" class="preferences-backdrop" hidden>
+      <section class="preferences-window" role="dialog" aria-modal="true" aria-labelledby="preferences-title">
+        <header class="preferences-header"><div><h2 id="preferences-title">Preferences</h2><p>Customize your writing environment</p></div><button id="preferences-close" class="preferences-close" aria-label="Close preferences">×</button></header>
+        <div class="preferences-body">
+          <nav class="preferences-nav" aria-label="Preference categories">
+            <button class="preferences-tab selected" data-preference-tab="files">Files</button>
+            <button class="preferences-tab" data-preference-tab="editor">Editor</button>
+            <button class="preferences-tab" data-preference-tab="image">Image</button>
+            <button class="preferences-tab" data-preference-tab="markdown">Markdown</button>
+            <button class="preferences-tab" data-preference-tab="export">Export</button>
+            <button class="preferences-tab" data-preference-tab="appearance">Appearance</button>
+            <button class="preferences-tab" data-preference-tab="general">General</button>
+          </nav>
+          <div class="preferences-content">
+            <section class="preferences-panel" data-preference-panel="files">
+              <h3>Files</h3>
+              <label class="preference-row"><span><b>Save recovery drafts</b><small>Keep a local draft while you edit.</small></span><input type="checkbox" data-pref="autoRecover"></label>
+              <label class="preference-row"><span><b>Offer draft recovery on startup</b><small>Ask whether to restore an unsaved draft.</small></span><input type="checkbox" data-pref="restoreDraft"></label>
+              <label class="preference-row"><span><b>Auto save open documents</b><small>Save named documents periodically while editing.</small></span><input type="checkbox" data-pref="autoSave"></label>
+              <label class="preference-row stacked"><span><b>Auto save interval</b></span><select data-pref="autoSaveInterval"><option value="1">Every minute</option><option value="5">Every 5 minutes</option><option value="10">Every 10 minutes</option></select></label>
+              <label class="preference-row"><span><b>Save before switching files</b><small>Save the current named document before opening another.</small></span><input type="checkbox" data-pref="saveOnSwitch"></label>
+              <label class="preference-row stacked"><span><b>Default line endings for new files</b></span><select data-pref="defaultLineEnding"><option value="lf">Unix (LF)</option><option value="crlf">Windows (CRLF)</option></select></label>
+            </section>
+            <section class="preferences-panel" data-preference-panel="editor" hidden>
+              <h3>Editor</h3>
+              <label class="preference-row"><span><b>Spell check</b><small>Use the system WebView dictionary.</small></span><input type="checkbox" data-pref="spellCheck"></label>
+              <label class="preference-row stacked"><span><b>Editor font</b></span><select data-pref="fontFamily"><option value="sans">Sans Serif</option><option value="serif">Serif</option><option value="mono">Monospace</option></select></label>
+              <label class="preference-row stacked"><span><b>Font size <output data-pref-output="fontSize"></output></b></span><input type="range" min="13" max="24" step="1" data-pref="fontSize"></label>
+              <label class="preference-row stacked"><span><b>Line height <output data-pref-output="lineHeight"></output></b></span><input type="range" min="1.2" max="2.2" step="0.1" data-pref="lineHeight"></label>
+              <label class="preference-row stacked"><span><b>Source tab width</b></span><select data-pref="tabSize"><option value="2">2 spaces</option><option value="4">4 spaces</option><option value="8">8 spaces</option></select></label>
+              <label class="preference-row"><span><b>Auto pair brackets and quotes</b><small>Insert the closing character when typing an opener.</small></span><input type="checkbox" data-pref="autoPair"></label>
+              <label class="preference-row"><span><b>Auto format headings and lists</b><small>Turn Markdown prefixes into formatted blocks when followed by a space.</small></span><input type="checkbox" data-pref="autoFormatMarkdown"></label>
+              <label class="preference-row"><span><b>Wrap long code lines</b></span><input type="checkbox" data-pref="wrapCode"></label>
+              <label class="preference-row"><span><b>Show code line numbers</b></span><input type="checkbox" data-pref="codeLineNumbers"></label>
+            </section>
+            <section class="preferences-panel" data-preference-panel="image" hidden>
+              <h3>Image</h3>
+              <label class="preference-row stacked"><span><b>Copy inserted images to</b><small>Choose where imported images are stored beside the Markdown file.</small></span><select data-pref="imageLocation"><option value="document-assets">Document.assets folder</option><option value="assets">assets folder</option><option value="same-folder">Same folder as the document</option></select></label>
+              <label class="preference-row"><span><b>Add ./ to relative image paths</b></span><input type="checkbox" data-pref="relativeImageDot"></label>
+            </section>
+            <section class="preferences-panel" data-preference-panel="markdown" hidden>
+              <h3>Markdown</h3>
+              <label class="preference-row"><span><b>Smart punctuation</b><small>Convert quotes, ellipses, and dashes to typographic characters.</small></span><input type="checkbox" data-pref="smartPunctuation"></label>
+              <label class="preference-row"><span><b>Inline and display math</b></span><input type="checkbox" data-pref="enableMath"></label>
+              <label class="preference-row"><span><b>Subscript</b><small>Enable H~2~O syntax.</small></span><input type="checkbox" data-pref="enableSubscript"></label>
+              <label class="preference-row"><span><b>Superscript</b><small>Enable x^2^ syntax.</small></span><input type="checkbox" data-pref="enableSuperscript"></label>
+              <label class="preference-row"><span><b>Emoji shortcodes</b><small>Convert supported names such as :smile: to emoji.</small></span><input type="checkbox" data-pref="emojiShortcodes"></label>
+              <label class="preference-row"><span><b>Treat single line breaks as hard breaks</b></span><input type="checkbox" data-pref="hardLineBreaks"></label>
+            </section>
+            <section class="preferences-panel" data-preference-panel="export" hidden>
+              <h3>Export</h3>
+              <label class="preference-row"><span><b>Use current theme in HTML export</b><small>Apply your selected theme and editor typography.</small></span><input type="checkbox" data-pref="exportTheme"></label>
+              <label class="preference-row"><span><b>Include document outline</b><small>Add linked headings at the top of exported HTML.</small></span><input type="checkbox" data-pref="exportOutline"></label>
+              <label class="preference-row"><span><b>Start each top-level section on a new page</b><small>Applied to print and PDF output.</small></span><input type="checkbox" data-pref="pageBreakHeadings"></label>
+            </section>
+            <section class="preferences-panel" data-preference-panel="appearance" hidden>
+              <h3>Appearance</h3>
+              <label class="preference-row stacked"><span><b>Theme</b></span><select data-pref="theme"><option value="github">GitHub</option><option value="newsprint">Newsprint</option><option value="night">Night</option></select></label>
+              <label class="preference-row stacked"><span><b>Document width <output data-pref-output="contentWidth"></output></b></span><input type="range" min="680" max="1200" step="20" data-pref="contentWidth"></label>
+              <label class="preference-row stacked"><span><b>UI zoom <output data-pref-output="zoom"></output></b></span><input type="range" min="80" max="130" step="5" data-pref="zoom"></label>
+            </section>
+            <section class="preferences-panel" data-preference-panel="general" hidden>
+              <h3>General</h3>
+              <label class="preference-row stacked"><span><b>Startup sidebar</b><small>Choose which panel opens when Typora RS starts.</small></span><select data-pref="startupSidebar"><option value="none">Hidden</option><option value="outline">Outline</option><option value="files">Files</option></select></label>
+              <label class="preference-row"><span><b>Show status bar</b><small>Display word count and editor controls.</small></span><input type="checkbox" data-pref="statusBar"></label>
+              <label class="preference-row"><span><b>Keep caret centered in Typewriter Mode</b><small>Scroll the active paragraph toward the middle as you type.</small></span><input type="checkbox" data-pref="typewriterCenter"></label>
+              <button id="preferences-reset" class="preferences-reset">Restore defaults</button>
+            </section>
+          </div>
+        </div>
+        <footer class="preferences-footer"><span>Changes are saved automatically.</span><button id="preferences-done">Done</button></footer>
+      </section>
+    </div>
 
     <div class="workspace">
       <aside id="sidebar" class="sidebar" hidden>

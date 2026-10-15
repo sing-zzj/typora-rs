@@ -14,9 +14,79 @@ const replaceRow = document.querySelector("#replace-row");
 const wordPopover = document.querySelector("#word-popover");
 const tableToolbar = document.querySelector("#table-toolbar");
 const BACKTICK = String.fromCharCode(96);
+const preferenceDefaults = {
+  autoRecover: true,
+  restoreDraft: true,
+  autoSave: false,
+  autoSaveInterval: 1,
+  saveOnSwitch: false,
+  defaultLineEnding: "lf",
+  spellCheck: false,
+  fontFamily: "sans",
+  fontSize: 16,
+  lineHeight: 1.6,
+  tabSize: 2,
+  autoPair: true,
+  autoFormatMarkdown: true,
+  wrapCode: false,
+  codeLineNumbers: false,
+  imageLocation: "document-assets",
+  relativeImageDot: true,
+  smartPunctuation: false,
+  enableMath: true,
+  enableSubscript: true,
+  enableSuperscript: true,
+  emojiShortcodes: true,
+  hardLineBreaks: false,
+  exportTheme: true,
+  exportOutline: false,
+  pageBreakHeadings: false,
+  theme: "github",
+  contentWidth: 920,
+  zoom: 100,
+  startupSidebar: "none",
+  statusBar: true,
+  typewriterCenter: true,
+};
+const preferenceKey = "typora-rs-preferences-v1";
+let preferences = loadPreferences();
+
+function loadPreferences() {
+  try { return { ...preferenceDefaults, ...JSON.parse(localStorage.getItem(preferenceKey) || "{}") }; }
+  catch (_) { return { ...preferenceDefaults }; }
+}
+
+function savePreferences() {
+  localStorage.setItem(preferenceKey, JSON.stringify(preferences));
+}
+
+function applyPreferences() {
+  const fonts = {
+    sans: '"Helvetica Neue", Helvetica, Arial, "Microsoft YaHei UI", sans-serif',
+    serif: 'Georgia, "Songti SC", serif',
+    mono: 'Consolas, "Courier New", monospace',
+  };
+  document.documentElement.style.setProperty("--document-font-family", fonts[preferences.fontFamily] || fonts.sans);
+  document.documentElement.style.setProperty("--document-font-size", `${preferences.fontSize}px`);
+  document.documentElement.style.setProperty("--document-line-height", preferences.lineHeight);
+  document.documentElement.style.setProperty("--document-width", `${preferences.contentWidth}px`);
+  document.documentElement.style.setProperty("--source-tab-size", preferences.tabSize);
+  document.body.style.zoom = preferences.zoom === 100 ? "" : String(preferences.zoom / 100);
+  document.body.classList.toggle("wrap-code-lines", preferences.wrapCode);
+  document.body.classList.toggle("print-page-breaks", preferences.pageBreakHeadings);
+  editor.spellcheck = preferences.spellCheck;
+  source.spellcheck = preferences.spellCheck;
+  document.body.classList.toggle("hide-statusbar", !preferences.statusBar);
+  if (preferences.theme === "github") delete document.body.dataset.theme;
+  else document.body.dataset.theme = preferences.theme;
+  document.querySelector("#highlight-light").disabled = preferences.theme === "night";
+  document.querySelector("#highlight-dark").disabled = preferences.theme !== "night";
+}
+
+applyPreferences();
 
 let activePath = null;
-let activeLineEnding = "lf";
+let activeLineEnding = preferences.defaultLineEnding;
 let savedMarkdown = "";
 let dirty = false;
 let sourceMode = false;
@@ -26,9 +96,10 @@ let activePanel = "outline";
 let folderPath = null;
 let folderRoot = null;
 let folderFilter = "";
-let zoomLevel = 1;
+let zoomLevel = preferences.zoom / 100;
 let recoveryTimer = null;
 let wordCountTimer = null;
+let autoSaveTimer = null;
 let activeTableCell = null;
 let renderSequence = 0;
 let outlineSignature = null;
@@ -126,7 +197,15 @@ function renderMarkdown(markdown) {
   previewObservers.clear();
   editor.setAttribute("aria-busy", "true");
   statusCenter.textContent = "正在解析 Markdown…";
-  return invoke("render_markdown", { source: markdown, documentPath: activePath }).then(async (result) => {
+  return invoke("render_markdown", {
+    source: markdown, documentPath: activePath,
+    smartPunctuation: preferences.smartPunctuation,
+    enableMath: preferences.enableMath,
+    enableSubscript: preferences.enableSubscript,
+    enableSuperscript: preferences.enableSuperscript,
+    emojiShortcodes: preferences.emojiShortcodes,
+    hardLineBreaks: preferences.hardLineBreaks,
+  }).then(async (result) => {
     if (sequence !== renderSequence) return;
     const frontMatter = markdown.match(/^---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/);
     editor.dataset.frontMatter = frontMatter ? frontMatter[0].replace(/\r\n?/g, "\n") : "";
@@ -270,7 +349,7 @@ function placeCaretAtEnd(element) {
 }
 
 async function openDocument() {
-  if (dirty && !window.confirm("This document has unsaved changes. Continue and discard them?")) return;
+  if (!(await canSwitchDocument())) return;
   try {
     const file = await invoke("open_document");
     if (!file) return;
@@ -279,6 +358,15 @@ async function openDocument() {
   } catch (error) {
     window.alert(String(error));
   }
+}
+
+async function canSwitchDocument() {
+  if (!dirty) return true;
+  if (preferences.saveOnSwitch && activePath) {
+    await saveDocument(false);
+    return !dirty;
+  }
+  return window.confirm("This document has unsaved changes. Continue and discard them?");
 }
 
 async function showDocument(file) {
@@ -399,7 +487,7 @@ async function refreshFolder(path) {
       button.hidden = !entry.name.toLocaleLowerCase().includes(folderFilter.toLocaleLowerCase());
       button.addEventListener("click", async () => {
         if (entry.isDirectory) await refreshFolder(entry.path);
-        else if (!dirty || window.confirm("This document has unsaved changes. Continue and discard them?")) {
+        else if (await canSwitchDocument()) {
           try {
             const file = await invoke("open_document_by_path", { path: entry.path });
             await invoke("clear_recovery_draft");
@@ -440,9 +528,11 @@ async function saveDocument(saveAs) {
   if (!dirty && !saveAs && activePath) return;
   const markdown = markdownNow();
   try {
-    const path = await invoke("save_document", { content: markdown, saveAs: Boolean(saveAs), lineEnding: activeLineEnding });
+    const lineEnding = activePath ? activeLineEnding : preferences.defaultLineEnding;
+    const path = await invoke("save_document", { content: markdown, saveAs: Boolean(saveAs), lineEnding });
     if (!path) return;
     activePath = path;
+    activeLineEnding = lineEnding;
     savedMarkdown = markdown;
     source.value = markdown;
     clearTimeout(recoveryTimer);
@@ -451,6 +541,26 @@ async function saveDocument(saveAs) {
   } catch (error) {
     window.alert(String(error));
   }
+}
+
+function resetAutoSaveTimer() {
+  clearInterval(autoSaveTimer);
+  autoSaveTimer = null;
+  if (!preferences.autoSave) return;
+  autoSaveTimer = setInterval(async () => {
+    if (!dirty || !activePath) return;
+    const markdown = markdownNow();
+    try {
+      const path = await invoke("save_document", { content: markdown, saveAs: false, lineEnding: activeLineEnding });
+      if (!path) return;
+      savedMarkdown = markdown;
+      if (markdownNow() === markdown) {
+        clearTimeout(recoveryTimer);
+        await invoke("clear_recovery_draft");
+        setDirty(false);
+      }
+    } catch (error) { console.error("Auto save failed", error); }
+  }, Number(preferences.autoSaveInterval) * 60_000);
 }
 
 async function toggleSourceMode() {
@@ -674,6 +784,20 @@ function runWhenVisible(container, elements, action, eager) {
   elements.forEach((element) => observer.observe(element));
 }
 
+function highlightCode(code) {
+  window.hljs.highlightElement(code);
+  if (!preferences.codeLineNumbers) return;
+  const pre = code.closest("pre");
+  if (!pre || pre.querySelector(".code-gutter")) return;
+  const lineCount = Math.max(1, (code.textContent || "").replace(/\n$/, "").split("\n").length);
+  const gutter = document.createElement("span");
+  gutter.className = "code-gutter";
+  gutter.setAttribute("aria-hidden", "true");
+  gutter.textContent = Array.from({ length: lineCount }, (_, index) => String(index + 1)).join("\n");
+  pre.classList.add("numbered-code");
+  pre.insertBefore(gutter, code);
+}
+
 async function enhancePreview(container, { eager = false } = {}) {
   container.querySelectorAll(".math-inline,.math-display").forEach((math) => {
     const tex = math.textContent || "";
@@ -685,7 +809,7 @@ async function enhancePreview(container, { eager = false } = {}) {
       strict: "ignore"
     });
   });
-  if (window.hljs) runWhenVisible(container, [...container.querySelectorAll("pre code:not(.language-mermaid)")], (code) => window.hljs.highlightElement(code), eager);
+  if (window.hljs) runWhenVisible(container, [...container.querySelectorAll("pre code:not(.language-mermaid)")], highlightCode, eager);
   const diagrams = [...container.querySelectorAll("pre code.language-mermaid")].map((code) => {
     const sourceText = code.textContent || "";
     const diagram = document.createElement("div");
@@ -725,7 +849,7 @@ function insertLink() {
 
 async function insertImage() {
   try {
-    const image = await invoke("import_image");
+    const image = await invoke("import_image", { imageLocation: preferences.imageLocation, relativeDot: preferences.relativeImageDot });
     if (!image) return;
     editor.focus();
     const html = '<img alt="' + escapeAttribute(image.alt) + '" src="' + escapeAttribute(image.dataUrl) + '" data-markdown-src="' + escapeAttribute(image.markdownUrl) + '">';
@@ -759,14 +883,14 @@ function performAction(action, item) {
       wordPopover.hidden = !wordPopover.hidden;
       if (!wordPopover.hidden) updateWordCount();
       break;
-    case "status-bar": document.body.classList.toggle("hide-statusbar"); break;
+    case "status-bar": preferences.statusBar = !preferences.statusBar; savePreferences(); applyPreferences(); break;
     case "fullscreen":
       if (document.fullscreenElement) void document.exitFullscreen();
       else void document.documentElement.requestFullscreen();
       break;
-    case "zoom-in": zoomLevel = Math.min(1.5, zoomLevel + 0.1); document.body.style.zoom = zoomLevel; break;
-    case "zoom-out": zoomLevel = Math.max(0.7, zoomLevel - 0.1); document.body.style.zoom = zoomLevel; break;
-    case "zoom-reset": zoomLevel = 1; document.body.style.zoom = ""; break;
+    case "zoom-in": zoomLevel = Math.min(1.5, zoomLevel + 0.1); preferences.zoom = Math.round(zoomLevel * 100); savePreferences(); applyPreferences(); break;
+    case "zoom-out": zoomLevel = Math.max(0.7, zoomLevel - 0.1); preferences.zoom = Math.round(zoomLevel * 100); savePreferences(); applyPreferences(); break;
+    case "zoom-reset": zoomLevel = 1; preferences.zoom = 100; savePreferences(); applyPreferences(); break;
     case "bold": document.execCommand("bold"); break;
     case "italic": document.execCommand("italic"); break;
     case "strike": document.execCommand("strikeThrough"); break;
@@ -789,6 +913,7 @@ function performAction(action, item) {
     case "shortcuts": window.alert("Ctrl+O 打开 · Ctrl+S 保存 · Ctrl+/ 源码模式\nCtrl+F 查找 · Ctrl+H 查找替换\nCtrl+B 加粗 · Ctrl+I 斜体 · Ctrl+K 链接\nCtrl+Shift+O 大纲 · Ctrl+Shift+T 打字机模式"); break;
     case "export-html": void exportHtml(); break;
     case "export-pdf": void printDocument(); break;
+    case "preferences": openPreferences(); break;
     case "table-add-row": editActiveTable("add-row"); break;
     case "table-add-column": editActiveTable("add-column"); break;
     case "table-delete-row": editActiveTable("delete-row"); break;
@@ -802,15 +927,58 @@ function performAction(action, item) {
 async function exportHtml() {
   try {
     const markdown = markdownNow();
-    const rendered = await invoke("render_markdown", { source: markdown, documentPath: activePath });
+    const rendered = await invoke("render_markdown", {
+      source: markdown, documentPath: activePath,
+      smartPunctuation: preferences.smartPunctuation,
+      enableMath: preferences.enableMath,
+      enableSubscript: preferences.enableSubscript,
+      enableSuperscript: preferences.enableSuperscript,
+      emojiShortcodes: preferences.emojiShortcodes,
+      hardLineBreaks: preferences.hardLineBreaks,
+    });
     const preview = document.createElement("div");
     preview.innerHTML = rendered.html;
     preview.querySelectorAll("img").forEach((image, index) => {
       if (rendered.images[index]) image.src = rendered.images[index].previewUrl;
     });
+    if (preferences.exportOutline) {
+      const headings = [...preview.querySelectorAll("h1,h2,h3,h4,h5,h6")];
+      const used = new Map();
+      const nav = document.createElement("nav");
+      nav.className = "export-outline";
+      const title = document.createElement("strong");
+      title.textContent = "Contents";
+      const list = document.createElement("ul");
+      headings.forEach((heading) => {
+        const label = heading.textContent.trim();
+        const base = heading.id || slugify(label);
+        const count = used.get(base) || 0;
+        used.set(base, count + 1);
+        heading.id = base + (count ? "-" + count : "");
+        const item = document.createElement("li");
+        item.className = "level-" + heading.tagName.slice(1);
+        const link = document.createElement("a");
+        link.href = "#" + heading.id;
+        link.textContent = label;
+        item.append(link);
+        list.append(item);
+      });
+      nav.append(title, list);
+      preview.prepend(nav);
+    }
     await enhancePreview(preview, { eager: true });
     const katexCss = await getKatexCssWithEmbeddedFonts();
-    const styles = katexCss + "\nbody{max-width:860px;margin:48px auto;padding:0 24px;color:#24292f;font:16px/1.75 Arial,'Microsoft YaHei UI',sans-serif}img,svg{max-width:100%}pre,code{font-family:Consolas,monospace}pre{padding:16px;background:#f6f8fa;border-radius:6px;overflow:auto}code{padding:.2em .4em;background:#eff1f3;border-radius:4px}table{border-collapse:collapse}th,td{padding:6px 12px;border:1px solid #d0d7de}blockquote{border-left:4px solid #d0d7de;padding-left:16px;color:#57606a}a{color:#0969da}";
+    const exportColors = preferences.exportTheme && preferences.theme === "night"
+      ? "background:#282c34;color:#d7dae0"
+      : preferences.exportTheme && preferences.theme === "newsprint"
+        ? "background:#f5f1e8;color:#433e35"
+        : "background:#fff;color:#24292f";
+    const exportFont = !preferences.exportTheme ? 'Arial,"Microsoft YaHei UI",sans-serif' : preferences.fontFamily === "serif" ? 'Georgia,"Songti SC",serif' : preferences.fontFamily === "mono" ? 'Consolas,"Courier New",monospace' : 'Arial,"Microsoft YaHei UI",sans-serif';
+    const exportWidth = preferences.exportTheme ? preferences.contentWidth : 860;
+    const exportSize = preferences.exportTheme ? preferences.fontSize : 16;
+    const exportHeight = preferences.exportTheme ? preferences.lineHeight : 1.75;
+    const exportBackground = preferences.exportTheme ? exportColors : "background:#fff;color:#24292f";
+    const styles = katexCss + `\nbody{max-width:${exportWidth}px;margin:48px auto;padding:0 24px;${exportBackground};font:${exportSize}px/${exportHeight} ${exportFont}}img,svg{max-width:100%}pre,code{font-family:Consolas,monospace}pre{padding:16px;background:#f6f8fa;border-radius:6px;overflow:auto}code{padding:.2em .4em;background:#eff1f3;border-radius:4px}table{border-collapse:collapse}th,td{padding:6px 12px;border:1px solid #d0d7de}blockquote{border-left:4px solid #d0d7de;padding-left:16px;color:#57606a}a{color:#0969da}.export-outline{padding:14px 18px;margin:0 0 28px;background:#f6f8fa;border-radius:5px}.export-outline ul{padding-left:22px}.export-outline .level-2{margin-left:14px}.export-outline .level-3,.export-outline .level-4,.export-outline .level-5,.export-outline .level-6{margin-left:28px}.numbered-code{display:flex;gap:12px}.code-gutter{border-right:1px solid #d0d7de;padding-right:10px;color:#8c959f;text-align:right;white-space:pre;user-select:none}`;
     await invoke("export_html", { html: preview.innerHTML, styles });
   } catch (error) { window.alert(String(error)); }
 }
@@ -855,6 +1023,72 @@ function closeMenus() {
   document.querySelectorAll(".menu-trigger").forEach((button) => button.classList.remove("open"));
 }
 
+const preferencesDialog = document.querySelector("#preferences-dialog");
+
+function selectPreferenceTab(tabName) {
+  document.querySelectorAll("[data-preference-tab]").forEach((tab) => tab.classList.toggle("selected", tab.dataset.preferenceTab === tabName));
+  document.querySelectorAll("[data-preference-panel]").forEach((panel) => { panel.hidden = panel.dataset.preferencePanel !== tabName; });
+}
+
+function refreshPreferenceControls() {
+  document.querySelectorAll("[data-pref]").forEach((control) => {
+    const key = control.dataset.pref;
+    control.type === "checkbox" ? control.checked = Boolean(preferences[key]) : control.value = String(preferences[key]);
+  });
+  document.querySelectorAll("[data-pref-output]").forEach((output) => {
+    const value = preferences[output.dataset.prefOutput];
+    const suffix = output.dataset.prefOutput === "zoom" ? "%" : output.dataset.prefOutput === "lineHeight" ? "" : " px";
+    output.textContent = `${output.dataset.prefOutput === "lineHeight" ? Number(value).toFixed(1) : value}${suffix}`;
+  });
+}
+
+function openPreferences() {
+  closeMenus();
+  refreshPreferenceControls();
+  selectPreferenceTab("files");
+  preferencesDialog.hidden = false;
+  document.querySelector("#preferences-close").focus();
+}
+
+function closePreferences() {
+  preferencesDialog.hidden = true;
+  (sourceMode ? source : editor).focus();
+}
+
+function applyPreferenceChange(control) {
+  const key = control.dataset.pref;
+  preferences[key] = control.type === "checkbox" ? control.checked : ["fontSize", "lineHeight", "tabSize", "contentWidth", "zoom", "autoSaveInterval"].includes(key) ? Number(control.value) : control.value;
+  if (key === "zoom") zoomLevel = preferences.zoom / 100;
+  savePreferences();
+  applyPreferences();
+  refreshPreferenceControls();
+  if (key === "autoRecover" && !preferences.autoRecover) {
+    clearTimeout(recoveryTimer);
+    void invoke("clear_recovery_draft");
+  }
+  if (key === "autoSave" || key === "autoSaveInterval") resetAutoSaveTimer();
+  if (["smartPunctuation", "enableMath", "enableSubscript", "enableSuperscript", "emojiShortcodes", "hardLineBreaks", "codeLineNumbers"].includes(key)) void renderMarkdown(markdownNow());
+  if (key === "defaultLineEnding" && !activePath) activeLineEnding = preferences.defaultLineEnding;
+}
+
+document.querySelectorAll("[data-preference-tab]").forEach((tab) => tab.addEventListener("click", () => selectPreferenceTab(tab.dataset.preferenceTab)));
+document.querySelectorAll("[data-pref]").forEach((control) => {
+  control.addEventListener(control.type === "range" ? "input" : "change", () => applyPreferenceChange(control));
+});
+document.querySelector("#preferences-close").addEventListener("click", closePreferences);
+document.querySelector("#preferences-done").addEventListener("click", closePreferences);
+preferencesDialog.addEventListener("click", (event) => { if (event.target === preferencesDialog) closePreferences(); });
+document.querySelector("#preferences-reset").addEventListener("click", () => {
+  preferences = { ...preferenceDefaults };
+  zoomLevel = preferences.zoom / 100;
+  savePreferences();
+  applyPreferences();
+  refreshPreferenceControls();
+  activeLineEnding = activePath ? activeLineEnding : preferences.defaultLineEnding;
+  resetAutoSaveTimer();
+  void renderMarkdown(markdownNow());
+});
+
 function updateAfterEdit() {
   updateOutline();
   scheduleWordCount();
@@ -862,12 +1096,12 @@ function updateAfterEdit() {
   scheduleRecoveryDraft();
   const empty = editor.childNodes.length === 0 || (editor.childNodes.length === 1 && !editor.textContent.trim());
   editor.classList.toggle("is-empty", empty);
-  if (typewriterMode) activeBlock()?.scrollIntoView({ behavior: "smooth", block: "center" });
+  if (typewriterMode && preferences.typewriterCenter) activeBlock()?.scrollIntoView({ behavior: "smooth", block: "center" });
 }
 
 function scheduleRecoveryDraft() {
   clearTimeout(recoveryTimer);
-  if (!dirty) return;
+  if (!dirty || !preferences.autoRecover) return;
   recoveryTimer = setTimeout(() => {
     void invoke("save_recovery_draft", {
       content: markdownNow(),
@@ -878,6 +1112,7 @@ function scheduleRecoveryDraft() {
 }
 
 async function restoreRecoveryDraft() {
+  if (!preferences.restoreDraft) return;
   try {
     const draft = await invoke("load_recovery_draft");
     if (!draft) return;
@@ -916,6 +1151,34 @@ function activeBlock() {
   return node?.closest?.("p,h1,h2,h3,h4,h5,h6,li,pre,blockquote,table") || null;
 }
 
+const typingPairs = { "(": ")", "[": "]", "{": "}", "\"": "\"", "'": "'", "`": "`" };
+
+function handleSourcePairKeydown(event) {
+  if (!preferences.autoPair || event.ctrlKey || event.metaKey || event.altKey) return false;
+  const start = source.selectionStart;
+  const end = source.selectionEnd;
+  const next = source.value[end];
+  if (Object.values(typingPairs).includes(event.key) && next === event.key && start === end) {
+    event.preventDefault();
+    source.setSelectionRange(end + 1, end + 1);
+    return true;
+  }
+  if (event.key === "Backspace" && start === end && start > 0 && typingPairs[source.value[start - 1]] === next) {
+    event.preventDefault();
+    source.setRangeText("", start - 1, end + 1, "end");
+    updateAfterEdit();
+    return true;
+  }
+  const closing = typingPairs[event.key];
+  if (!closing) return false;
+  event.preventDefault();
+  const selected = source.value.slice(start, end);
+  source.setRangeText(event.key + selected + closing, start, end, "end");
+  source.setSelectionRange(start + 1 + selected.length, start + 1 + selected.length);
+  updateAfterEdit();
+  return true;
+}
+
 document.querySelectorAll(".menu-trigger").forEach((button) => {
   button.addEventListener("click", (event) => {
     event.stopPropagation();
@@ -933,9 +1196,9 @@ document.querySelectorAll("[data-action]").forEach((item) => {
 
 document.querySelectorAll("[data-theme]").forEach((button) => {
   button.addEventListener("click", () => {
-    document.body.dataset.theme = button.dataset.theme;
-    document.querySelector("#highlight-light").disabled = button.dataset.theme === "night";
-    document.querySelector("#highlight-dark").disabled = button.dataset.theme !== "night";
+    preferences.theme = button.dataset.theme;
+    savePreferences();
+    applyPreferences();
     closeMenus();
   });
 });
@@ -981,6 +1244,40 @@ editor.addEventListener("input", updateAfterEdit);
 source.addEventListener("input", updateAfterEdit);
 
 editor.addEventListener("keydown", (event) => {
+  if (!sourceMode && preferences.autoPair && !event.ctrlKey && !event.metaKey && !event.altKey) {
+    const selection = window.getSelection();
+    const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+    if (range && Object.values(typingPairs).includes(event.key) && !range.collapsed && range.toString() === "") return;
+    const nextNode = range?.startContainer;
+    if (Object.values(typingPairs).includes(event.key) && event.key === nextNode?.textContent?.[range.startOffset] && range.collapsed) {
+      event.preventDefault();
+      selection.modify("move", "forward", "character");
+      return;
+    }
+    if (event.key === "Backspace" && range?.collapsed && range.startContainer.nodeType === Node.TEXT_NODE) {
+      const node = range.startContainer;
+      const offset = range.startOffset;
+      if (offset > 0 && typingPairs[node.textContent[offset - 1]] === node.textContent[offset]) {
+        range.setStart(node, offset - 1);
+        range.setEnd(node, offset + 1);
+        range.deleteContents();
+        range.collapse(true);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        event.preventDefault();
+        updateAfterEdit();
+        return;
+      }
+    }
+    const closing = typingPairs[event.key];
+    if (closing) {
+      document.execCommand("insertText", false, event.key + (range?.toString() || "") + closing);
+      window.getSelection()?.modify("move", "backward", "character");
+      event.preventDefault();
+      updateAfterEdit();
+      return;
+    }
+  }
   if (event.ctrlKey && event.key === "Enter" && activeTableCell) {
     event.preventDefault();
     editActiveTable("add-row");
@@ -1004,7 +1301,7 @@ editor.addEventListener("keydown", (event) => {
     }
   }
   const block = activeBlock();
-  if (event.key === " ") {
+  if (preferences.autoFormatMarkdown && event.key === " ") {
     const text = block?.innerText || "";
     const heading = text.match(/^(#{1,6})$/);
     const bullet = text.match(/^[-+*]$/);
@@ -1015,7 +1312,7 @@ editor.addEventListener("keydown", (event) => {
       else document.execCommand(ordered ? "insertOrderedList" : "insertUnorderedList");
     }
   }
-  if (event.key === "Enter" && typewriterMode) setTimeout(() => activeBlock()?.scrollIntoView({ behavior: "smooth", block: "center" }), 0);
+  if (event.key === "Enter" && typewriterMode && preferences.typewriterCenter) setTimeout(() => activeBlock()?.scrollIntoView({ behavior: "smooth", block: "center" }), 0);
 });
 
 document.addEventListener("selectionchange", () => {
@@ -1049,11 +1346,13 @@ document.querySelector("#main-area").addEventListener("scroll", positionTableToo
 window.addEventListener("resize", positionTableToolbar);
 
 document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !preferencesDialog.hidden) { closePreferences(); return; }
   if (event.key === "F11") { event.preventDefault(); performAction("fullscreen"); return; }
   if ((event.ctrlKey || event.metaKey) && event.key === "0" && !event.shiftKey) { event.preventDefault(); performAction("zoom-reset"); return; }
   if ((event.ctrlKey || event.metaKey) && event.shiftKey && (event.key === "=" || event.key === "+")) { event.preventDefault(); performAction("zoom-in"); return; }
   if ((event.ctrlKey || event.metaKey) && event.shiftKey && (event.key === "-" || event.key === "_")) { event.preventDefault(); performAction("zoom-out"); return; }
   if (!(event.ctrlKey || event.metaKey)) return;
+  if (event.key === ",") { event.preventDefault(); openPreferences(); return; }
   const key = event.key.toLowerCase();
   if (event.shiftKey && key === "o") { event.preventDefault(); toggleSidebar("outline"); }
   else if (key === "o") { event.preventDefault(); void openDocument(); }
@@ -1068,11 +1367,12 @@ document.addEventListener("keydown", (event) => {
 });
 
 source.addEventListener("keydown", (event) => {
+  if (handleSourcePairKeydown(event)) return;
   if (event.key === "Tab") {
     event.preventDefault();
     const start = source.selectionStart;
     const end = source.selectionEnd;
-    source.setRangeText("  ", start, end, "end");
+    source.setRangeText(" ".repeat(preferences.tabSize), start, end, "end");
     updateAfterEdit();
   }
 });
@@ -1081,11 +1381,13 @@ window.addEventListener("beforeunload", (event) => {
   if (dirty) { event.preventDefault(); event.returnValue = ""; }
 });
 
+resetAutoSaveTimer();
 renderMarkdown("").then(() => {
   editor.innerHTML = "<p><br></p>";
   updateOutline();
   updateWordCount();
   setDirty(false);
+  if (preferences.startupSidebar !== "none") showSidebar(preferences.startupSidebar);
   placeCaretAtStart(editor.firstElementChild || editor);
   void restoreRecoveryDraft();
 });

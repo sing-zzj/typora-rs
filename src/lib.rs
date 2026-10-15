@@ -321,14 +321,35 @@ fn atomic_write(path: &PathBuf, contents: &[u8]) -> std::io::Result<()> {
 async fn render_markdown(
     source: String,
     document_path: Option<String>,
+    smart_punctuation: Option<bool>,
+    enable_math: Option<bool>,
+    enable_subscript: Option<bool>,
+    enable_superscript: Option<bool>,
+    emoji_shortcodes: Option<bool>,
+    hard_line_breaks: Option<bool>,
 ) -> Result<RenderedDocument, String> {
-    tauri::async_runtime::spawn_blocking(move || render_markdown_blocking(source, document_path))
-        .await
-        .map_err(|error| format!("预览任务失败：{error}"))
+    tauri::async_runtime::spawn_blocking(move || {
+        render_markdown_blocking_with_options(
+            source,
+            document_path,
+            smart_punctuation.unwrap_or(false),
+            enable_subscript.unwrap_or(true),
+            enable_superscript.unwrap_or(true),
+            enable_math.unwrap_or(true),
+            emoji_shortcodes.unwrap_or(true),
+            hard_line_breaks.unwrap_or(false),
+        )
+    })
+    .await
+    .map_err(|error| format!("预览任务失败：{error}"))
 }
 
 #[tauri::command]
-fn import_image(state: State<'_, EditorState>) -> Result<Option<ImportedImage>, String> {
+fn import_image(
+    state: State<'_, EditorState>,
+    image_location: Option<String>,
+    relative_dot: Option<bool>,
+) -> Result<Option<ImportedImage>, String> {
     let Some(source) = rfd::FileDialog::new()
         .add_filter(
             "Images",
@@ -351,7 +372,11 @@ fn import_image(state: State<'_, EditorState>) -> Result<Option<ImportedImage>, 
         .file_stem()
         .and_then(|name| name.to_str())
         .unwrap_or("document");
-    let asset_dir = parent.join(format!("{stem}.assets"));
+    let asset_dir = match image_location.as_deref() {
+        Some("assets") => parent.join("assets"),
+        Some("same-folder") => parent.to_path_buf(),
+        _ => parent.join(format!("{stem}.assets")),
+    };
     fs::create_dir_all(&asset_dir).map_err(|error| format!("无法创建图片目录：{error}"))?;
     let original_name = source
         .file_name()
@@ -374,20 +399,29 @@ fn import_image(state: State<'_, EditorState>) -> Result<Option<ImportedImage>, 
     let bytes = fs::read(&destination).map_err(|error| format!("无法读取图片：{error}"))?;
     let mime = image_mime(extension);
     let data_url = format!("data:{mime};base64,{}", STANDARD.encode(bytes));
-    let markdown_url = format!(
-        "{}/{}",
-        utf8_percent_encode(
-            &asset_dir.file_name().unwrap_or_default().to_string_lossy(),
-            NON_ALPHANUMERIC
-        ),
-        utf8_percent_encode(
-            &destination
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy(),
-            NON_ALPHANUMERIC
+    let destination_name = destination
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let encoded_name = utf8_percent_encode(&destination_name, NON_ALPHANUMERIC);
+    let relative_path = if asset_dir == parent {
+        encoded_name.to_string()
+    } else {
+        format!(
+            "{}/{}",
+            utf8_percent_encode(
+                &asset_dir.file_name().unwrap_or_default().to_string_lossy(),
+                NON_ALPHANUMERIC
+            ),
+            encoded_name
         )
-    );
+    };
+    let markdown_url = if relative_dot.unwrap_or(true) {
+        format!("./{relative_path}")
+    } else {
+        relative_path
+    };
     Ok(Some(ImportedImage {
         markdown_url,
         data_url,
@@ -422,19 +456,37 @@ fn export_html(html: String, styles: String) -> Result<Option<String>, String> {
     Ok(Some(path.to_string_lossy().into_owned()))
 }
 
-fn render_markdown_blocking(source: String, document_path: Option<String>) -> RenderedDocument {
+fn render_markdown_blocking_with_options(
+    source: String,
+    document_path: Option<String>,
+    smart_punctuation: bool,
+    enable_subscript: bool,
+    enable_superscript: bool,
+    enable_math: bool,
+    emoji_shortcodes: bool,
+    hard_line_breaks: bool,
+) -> RenderedDocument {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
     options.insert(Options::ENABLE_FOOTNOTES);
-    options.insert(Options::ENABLE_MATH);
+    if enable_math {
+        options.insert(Options::ENABLE_MATH);
+    }
     options.insert(Options::ENABLE_GFM);
     options.insert(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
     options.insert(Options::ENABLE_DEFINITION_LIST);
-    options.insert(Options::ENABLE_SUPERSCRIPT);
-    options.insert(Options::ENABLE_SUBSCRIPT);
+    if enable_superscript {
+        options.insert(Options::ENABLE_SUPERSCRIPT);
+    }
+    if enable_subscript {
+        options.insert(Options::ENABLE_SUBSCRIPT);
+    }
     options.insert(Options::ENABLE_HEADING_ATTRIBUTES);
+    if smart_punctuation {
+        options.insert(Options::ENABLE_SMART_PUNCTUATION);
+    }
 
     // Keep YAML front matter out of the Markdown body. The frontend retains
     // the original block separately so editing and saving does not lose it.
@@ -476,7 +528,7 @@ fn render_markdown_blocking(source: String, document_path: Option<String>) -> Re
                 safe_events.push(Event::End(end));
             }
             Event::Text(text) => {
-                let text = if in_code_block {
+                let text = if in_code_block || !emoji_shortcodes {
                     text
                 } else {
                     replace_emoji_shortcodes(&text).into()
@@ -492,6 +544,7 @@ fn render_markdown_blocking(source: String, document_path: Option<String>) -> Re
                 }
                 safe_events.push(Event::Code(text));
             }
+            Event::SoftBreak if hard_line_breaks => safe_events.push(Event::HardBreak),
             // Raw HTML passes through an HTML sanitizer before reaching the WebView.
             Event::Html(text) => safe_events.push(Event::Html(text)),
             Event::InlineHtml(text) => safe_events.push(Event::InlineHtml(text)),

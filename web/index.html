@@ -180,19 +180,13 @@
           <div id="outline" class="outline"><div class="sidebar-empty">Headings will appear here</div></div>
         </section>
         <section id="files-panel" class="sidebar-panel" hidden>
-          <div class="file-panel-top">
-            <div class="file-panel-actions">
-              <button id="open-folder" class="open-folder-button">打开文件夹…</button>
-              <button id="folder-up" title="返回上级目录" aria-label="返回上级目录">↑</button>
-              <button id="folder-refresh" title="刷新目录" aria-label="刷新目录">↻</button>
-              <button id="folder-copy" title="复制完整路径" aria-label="复制完整路径">⧉</button>
-            </div>
-            <div id="folder-location" class="folder-location"></div>
-            <input id="file-filter" class="file-filter" type="search" placeholder="筛选文件…" aria-label="筛选文件" />
+          <div id="file-library-tree" class="file-library-tree" tabindex="0" aria-label="文件树">
+            <div class="sidebar-empty">打开文件夹以浏览 Markdown 文档</div>
           </div>
-          <div class="sidebar-empty">Open a folder to browse Markdown documents</div>
         </section>
       </aside>
+
+      <div id="file-context-menu" class="file-context-menu" role="menu" hidden></div>
 
       <main id="main-area" class="main-area">
         <div id="editor" class="document" contenteditable="true" spellcheck="false" aria-label="Markdown document" role="textbox" aria-multiline="true"></div>
@@ -200,16 +194,7 @@
       </main>
     </div>
 
-    <div id="table-toolbar" class="table-toolbar" hidden aria-label="Table editing">
-      <button data-table-action="add-row" title="Add row">＋ Row</button>
-      <button data-table-action="add-column" title="Add column">＋ Col</button>
-      <button data-table-action="delete-row" title="Delete row">− Row</button>
-      <button data-table-action="delete-column" title="Delete column">− Col</button>
-      <span></span>
-      <button data-table-action="align-left" title="Align left">↤</button>
-      <button data-table-action="align-center" title="Align center">↔</button>
-      <button data-table-action="align-right" title="Align right">↦</button>
-    </div>
+    <button id="table-more-button" class="table-more-button" hidden>更多操作<span class="table-more-caret">⋮</span></button>
 
     <div id="findbar" class="findbar" hidden>
       <input id="find-input" type="search" placeholder="查找" aria-label="查找文本" />

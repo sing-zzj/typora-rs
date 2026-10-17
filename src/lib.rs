@@ -1,15 +1,23 @@
-use std::{fs, io::Write, path::PathBuf, sync::Mutex};
+use std::{
+    fs,
+    io::Write,
+    path::PathBuf,
+    sync::{Mutex, mpsc},
+    time::Duration,
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd, html};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 #[derive(Default)]
 struct EditorState {
     current_path: Mutex<Option<PathBuf>>,
     current_folder: Mutex<Option<PathBuf>>,
+    watcher: Mutex<Option<RecommendedWatcher>>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -199,6 +207,10 @@ fn read_folder_entries(root: PathBuf, path: PathBuf) -> Result<FolderListing, St
         if !canonical.starts_with(&root) {
             continue;
         }
+        let entry_name = entry.file_name().to_string_lossy().into_owned();
+        if entry_name.starts_with('.') || entry_name.eq_ignore_ascii_case("node_modules") {
+            continue;
+        }
         let is_directory = canonical.is_dir();
         let is_markdown = entry_path
             .extension()
@@ -211,7 +223,7 @@ fn read_folder_entries(root: PathBuf, path: PathBuf) -> Result<FolderListing, St
             });
         if is_directory || is_markdown {
             entries.push(FolderEntry {
-                name: entry.file_name().to_string_lossy().into_owned(),
+                name: entry_name,
                 path: canonical.to_string_lossy().into_owned(),
                 is_directory,
             });
@@ -227,6 +239,306 @@ fn read_folder_entries(root: PathBuf, path: PathBuf) -> Result<FolderListing, St
         root_path: root.to_string_lossy().into_owned(),
         entries,
     })
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct FsChange {
+    path: String,
+    kind: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CreatedEntry {
+    path: String,
+    name: String,
+    is_directory: bool,
+}
+
+fn ensure_within_root(state: &EditorState, path: &str) -> Result<PathBuf, String> {
+    let root = state
+        .current_folder
+        .lock()
+        .map_err(|_| "文档状态不可用".to_owned())?
+        .clone()
+        .ok_or_else(|| "请先选择文件夹".to_owned())?;
+    let target = PathBuf::from(path)
+        .canonicalize()
+        .map_err(|error| format!("无法访问路径：{error}"))?;
+    if !target.starts_with(&root) {
+        return Err("只能操作已选择文件夹中的内容".to_owned());
+    }
+    Ok(target)
+}
+
+fn sanitize_entry_name(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return Err("名称无效".to_owned());
+    }
+    if trimmed.chars().any(|character| {
+        matches!(
+            character,
+            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
+        ) || character.is_control()
+    }) {
+        return Err("名称不能包含 \\/:*?\"<>| 等字符".to_owned());
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn display_path(path: &PathBuf) -> String {
+    path.to_string_lossy().replace("\\\\?\\", "")
+}
+
+#[tauri::command]
+fn create_entry(
+    state: State<'_, EditorState>,
+    folder: String,
+    kind: String,
+) -> Result<Option<CreatedEntry>, String> {
+    let dir = ensure_within_root(state.inner(), &folder)?;
+    if !dir.is_dir() {
+        return Err("目标不是文件夹".to_owned());
+    }
+    let is_directory = kind == "folder";
+    let (base, extension) = if is_directory {
+        ("新建文件夹".to_owned(), String::new())
+    } else {
+        ("Untitled".to_owned(), "md".to_owned())
+    };
+    let mut suffix: u32 = 0;
+    loop {
+        let name = match (suffix, extension.is_empty()) {
+            (0, true) => base.clone(),
+            (0, false) => format!("{base}.{extension}"),
+            (n, true) => format!("{base} {n}"),
+            (n, false) => format!("{base} {n}.{extension}"),
+        };
+        let destination = dir.join(&name);
+        let result = if is_directory {
+            fs::create_dir(&destination)
+        } else {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&destination)
+                .map(|_| ())
+        };
+        match result {
+            Ok(()) => {
+                return Ok(Some(CreatedEntry {
+                    path: destination.to_string_lossy().into_owned(),
+                    name,
+                    is_directory,
+                }));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => suffix += 1,
+            Err(error) => return Err(format!("无法创建：{error}")),
+        }
+    }
+}
+
+#[tauri::command]
+fn rename_entry(
+    state: State<'_, EditorState>,
+    path: String,
+    new_name: String,
+) -> Result<String, String> {
+    let source = ensure_within_root(state.inner(), &path)?;
+    let name = sanitize_entry_name(&new_name)?;
+    let parent = source.parent().ok_or_else(|| "路径无效".to_owned())?;
+    let destination = parent.join(&name);
+    if destination.exists() {
+        return Err("同名文件或文件夹已存在".to_owned());
+    }
+    fs::rename(&source, &destination).map_err(|error| format!("无法重命名：{error}"))?;
+    Ok(destination.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn duplicate_entry(
+    state: State<'_, EditorState>,
+    path: String,
+) -> Result<Option<CreatedEntry>, String> {
+    let source = ensure_within_root(state.inner(), &path)?;
+    if source.is_dir() {
+        return Err("暂不支持复制文件夹".to_owned());
+    }
+    if !source.is_file() {
+        return Err("只能复制文件".to_owned());
+    }
+    let parent = source.parent().ok_or_else(|| "路径无效".to_owned())?;
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("file")
+        .to_owned();
+    let extension = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("md")
+        .to_owned();
+    let mut suffix: u32 = 0;
+    loop {
+        let name = match suffix {
+            0 => format!("{stem}-copy.{extension}"),
+            n => format!("{stem}-copy-{n}.{extension}"),
+        };
+        let destination = parent.join(&name);
+        match fs::copy(&source, &destination) {
+            Ok(_) => {
+                return Ok(Some(CreatedEntry {
+                    path: destination.to_string_lossy().into_owned(),
+                    name,
+                    is_directory: false,
+                }));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => suffix += 1,
+            Err(error) => return Err(format!("无法复制文件：{error}")),
+        }
+    }
+}
+
+#[tauri::command]
+fn trash_entry(state: State<'_, EditorState>, path: String) -> Result<(), String> {
+    let target = ensure_within_root(state.inner(), &path)?;
+    trash::delete(&target).map_err(|error| format!("无法移入回收站：{error}"))
+}
+
+#[tauri::command]
+fn reveal_entry(path: String) -> Result<(), String> {
+    let target = PathBuf::from(&path);
+    if !target.exists() {
+        return Err("路径不存在".to_owned());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let shown = display_path(&target);
+        let argument = if target.is_dir() {
+            shown
+        } else {
+            format!("/select,{shown}")
+        };
+        std::process::Command::new("explorer")
+            .arg(argument)
+            .spawn()
+            .map_err(|error| format!("无法打开资源管理器：{error}"))?;
+        return Ok(());
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = &target;
+        Err("当前平台不支持在文件管理器中显示".to_owned())
+    }
+}
+
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    let target = url.trim();
+    let lower = target.to_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("mailto:")) {
+        return Err("仅支持 HTTP、HTTPS 与 mailto 链接".to_owned());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(target)
+            .spawn()
+            .map_err(|error| format!("无法打开链接：{error}"))?;
+        return Ok(());
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = target;
+        Err("当前平台不支持打开链接".to_owned())
+    }
+}
+
+#[tauri::command]
+fn adopt_document_path(state: State<'_, EditorState>, path: String) -> Result<(), String> {
+    let path = PathBuf::from(&path)
+        .canonicalize()
+        .map_err(|error| format!("无法定位文件：{error}"))?;
+    if !path.is_file() {
+        return Err("文件不存在".to_owned());
+    }
+    *state
+        .current_path
+        .lock()
+        .map_err(|_| "文档状态不可用".to_owned())? = Some(path.clone());
+    if let Some(parent) = canonical_parent(&path) {
+        *state
+            .current_folder
+            .lock()
+            .map_err(|_| "文档状态不可用".to_owned())? = Some(parent.to_path_buf());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn watch_folder(
+    app: AppHandle,
+    state: State<'_, EditorState>,
+    path: String,
+) -> Result<(), String> {
+    let root = PathBuf::from(&path)
+        .canonicalize()
+        .map_err(|error| format!("无法监视文件夹：{error}"))?;
+    if !root.is_dir() {
+        return Err("只能监视文件夹".to_owned());
+    }
+    *state
+        .current_folder
+        .lock()
+        .map_err(|_| "文档状态不可用".to_owned())? = Some(root.clone());
+    let (tx, rx) = mpsc::channel();
+    let mut watcher =
+        notify::recommended_watcher(tx).map_err(|error| format!("无法创建文件监视器：{error}"))?;
+    watcher
+        .watch(&root, RecursiveMode::Recursive)
+        .map_err(|error| format!("无法监视文件夹：{error}"))?;
+    *state
+        .watcher
+        .lock()
+        .map_err(|_| "文档状态不可用".to_owned())? = Some(watcher);
+
+    let emitter = app.clone();
+    std::thread::spawn(move || {
+        const DEBOUNCE: Duration = Duration::from_millis(200);
+        let mut pending: Vec<FsChange> = Vec::new();
+        loop {
+            let timeout = if pending.is_empty() {
+                Duration::from_secs(3600)
+            } else {
+                DEBOUNCE
+            };
+            match rx.recv_timeout(timeout) {
+                Ok(Ok(event)) => {
+                    let kind = match event.kind {
+                        notify::EventKind::Create(_) => "create",
+                        notify::EventKind::Modify(_) => "modify",
+                        notify::EventKind::Remove(_) => "remove",
+                        _ => "other",
+                    };
+                    for path in event.paths {
+                        pending.push(FsChange {
+                            path: path.to_string_lossy().into_owned(),
+                            kind: kind.to_owned(),
+                        });
+                    }
+                }
+                Ok(Err(_)) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let _ = emitter.emit("fs-change", &pending);
+                    pending.clear();
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    });
+    Ok(())
 }
 
 #[tauri::command]
@@ -789,7 +1101,15 @@ pub fn run() {
             clear_recovery_draft,
             render_markdown,
             export_html,
-            import_image
+            import_image,
+            create_entry,
+            rename_entry,
+            duplicate_entry,
+            trash_entry,
+            reveal_entry,
+            open_url,
+            adopt_document_path,
+            watch_folder
         ])
         .run(tauri::generate_context!())
         .expect("启动 typora-rs 失败");

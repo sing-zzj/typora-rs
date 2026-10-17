@@ -12,7 +12,18 @@ const findCount = document.querySelector("#find-count");
 const replaceInput = document.querySelector("#replace-input");
 const replaceRow = document.querySelector("#replace-row");
 const wordPopover = document.querySelector("#word-popover");
-const tableToolbar = document.querySelector("#table-toolbar");
+const tableMoreButton = document.querySelector("#table-more-button");
+const codeLangTooltip = document.createElement("div");
+codeLangTooltip.id = "code-lang-tooltip";
+codeLangTooltip.className = "code-lang-tooltip";
+codeLangTooltip.innerHTML = '<span class="code-lang-value"></span>';
+codeLangTooltip.hidden = true;
+document.body.append(codeLangTooltip);
+codeLangTooltip.addEventListener("mousedown", (event) => event.preventDefault());
+codeLangTooltip.addEventListener("click", (event) => {
+  if (event.target.closest(".code-lang-list")) return;
+  beginLangEdit();
+});
 const BACKTICK = String.fromCharCode(96);
 const preferenceDefaults = {
   autoRecover: true,
@@ -23,12 +34,12 @@ const preferenceDefaults = {
   defaultLineEnding: "lf",
   spellCheck: false,
   fontFamily: "sans",
-  fontSize: 16,
+  fontSize: 17,
   lineHeight: 1.6,
   tabSize: 2,
   autoPair: true,
   autoFormatMarkdown: true,
-  wrapCode: false,
+  wrapCode: true,
   codeLineNumbers: false,
   imageLocation: "document-assets",
   relativeImageDot: true,
@@ -42,9 +53,9 @@ const preferenceDefaults = {
   exportOutline: false,
   pageBreakHeadings: false,
   theme: "github",
-  contentWidth: 920,
+  contentWidth: 1100,
   zoom: 100,
-  startupSidebar: "none",
+  startupSidebar: "files",
   statusBar: true,
   typewriterCenter: true,
 };
@@ -52,8 +63,21 @@ const preferenceKey = "typora-rs-preferences-v1";
 let preferences = loadPreferences();
 
 function loadPreferences() {
-  try { return { ...preferenceDefaults, ...JSON.parse(localStorage.getItem(preferenceKey) || "{}") }; }
-  catch (_) { return { ...preferenceDefaults }; }
+  let stored = {};
+  try { stored = JSON.parse(localStorage.getItem(preferenceKey) || "{}") || {}; } catch (_) {}
+  if (!localStorage.getItem("typora-rs-pref-layout-v2")) {
+    localStorage.setItem("typora-rs-pref-layout-v2", "1");
+    // One-time migration: these were the defaults before the layout was widened.
+    if (stored.fontSize === 16) stored.fontSize = preferenceDefaults.fontSize;
+    if (stored.contentWidth === 920) stored.contentWidth = preferenceDefaults.contentWidth;
+  }
+  if (!localStorage.getItem("typora-rs-pref-layout-v3")) {
+    localStorage.setItem("typora-rs-pref-layout-v3", "1");
+    // One-time migration: widen content further and default to wrapping code lines.
+    if (stored.contentWidth === 1000) stored.contentWidth = preferenceDefaults.contentWidth;
+    if (stored.wrapCode === false) stored.wrapCode = preferenceDefaults.wrapCode;
+  }
+  return { ...preferenceDefaults, ...stored };
 }
 
 function savePreferences() {
@@ -93,9 +117,13 @@ let sourceMode = false;
 let focusMode = false;
 let typewriterMode = false;
 let activePanel = "outline";
-let folderPath = null;
 let folderRoot = null;
-let folderFilter = "";
+let treeRootNode = null;
+const treeNodes = new Map();
+const treeElements = new Map();
+let selectedTreeNode = null;
+let renamingPath = null;
+let pendingFsEvents = [];
 let zoomLevel = preferences.zoom / 100;
 let recoveryTimer = null;
 let wordCountTimer = null;
@@ -167,28 +195,71 @@ function updateOutline() {
     return { heading, label, level, id };
   });
   const signature = rows.map(({ label, level, id }) => `${level}:${id}:${label}`).join("\u001f");
-  if (signature === outlineSignature) return;
-  outlineSignature = signature;
-  outline.replaceChildren();
-  if (!headings.length) {
-    const empty = document.createElement("div");
-    empty.className = "sidebar-empty";
-    empty.textContent = "Headings will appear here";
-    outline.append(empty);
-    return;
-  }
-  rows.forEach(({ heading, label, level, id }) => {
-    heading.id = id;
-    const item = document.createElement("button");
-    item.className = "outline-item level-" + level;
-    item.textContent = label;
-    item.title = label;
-    item.addEventListener("click", () => {
-      heading.scrollIntoView({ behavior: "smooth", block: "center" });
-      placeCaretAtStart(heading);
+  if (signature !== outlineSignature) {
+    outlineSignature = signature;
+    outline.replaceChildren();
+    if (!headings.length) {
+      const empty = document.createElement("div");
+      empty.className = "sidebar-empty";
+      empty.textContent = "Headings will appear here";
+      outline.append(empty);
+    }
+    rows.forEach(({ heading, label, level, id }) => {
+      heading.id = id;
+      const item = document.createElement("button");
+      item.className = "outline-item level-" + level;
+      item.textContent = label;
+      item.title = label;
+      item.addEventListener("click", () => {
+        heading.scrollIntoView({ behavior: "smooth", block: "center" });
+        placeCaretAtStart(heading);
+      });
+      outline.append(item);
     });
-    outline.append(item);
+  }
+  syncActiveOutlineItem();
+}
+
+function syncActiveOutlineItem() {
+  if (activePanel !== "outline") return;
+  const items = [...outline.querySelectorAll(".outline-item")];
+  if (!items.length) return;
+  const headings = [...editor.querySelectorAll("h1,h2,h3,h4,h5,h6")];
+  let index = -1;
+  headings.forEach((heading, index2) => {
+    if (heading.getBoundingClientRect().top <= 120) index = index2;
   });
+  items.forEach((item, index2) => item.classList.toggle("active", index2 === index));
+}
+
+function buildFrontMatterBlock(raw) {
+  if (!raw) return null;
+  const lines = raw.replace(/\r\n?/g, "\n")
+    .replace(/^---[ \t]*\n/, "")
+    .replace(/\n---[ \t]*(?:\n|$)$/, "")
+    .split("\n");
+  const block = document.createElement("div");
+  block.className = "front-matter";
+  block.contentEditable = "false";
+  let row = null;
+  for (const line of lines) {
+    const match = line.match(/^([^\s:][^:]*):(?:\s+(.*))?$/);
+    if (match) {
+      row = document.createElement("div");
+      row.className = "front-matter-row";
+      const key = document.createElement("span");
+      key.className = "front-matter-key";
+      key.textContent = match[1].trim();
+      const value = document.createElement("span");
+      value.className = "front-matter-value";
+      value.textContent = match[2] || "";
+      row.append(key, value);
+      block.append(row);
+    } else if (row && line.trim()) {
+      row.querySelector(".front-matter-value").textContent += "\n" + line;
+    }
+  }
+  return block.childElementCount ? block : null;
 }
 
 function renderMarkdown(markdown) {
@@ -217,6 +288,8 @@ function renderMarkdown(markdown) {
       if (result.images[index]) image.dataset.markdownSrc = result.images[index].markdownUrl;
     });
     if (!editor.firstChild) editor.innerHTML = "<p><br></p>";
+    const frontBlock = buildFrontMatterBlock(editor.dataset.frontMatter);
+    if (frontBlock) editor.insertBefore(frontBlock, editor.firstChild);
     await enhancePreview(editor);
     editor.classList.toggle("is-empty", !markdown.trim());
     editor.querySelectorAll("input[type=checkbox]").forEach((checkbox) => {
@@ -275,6 +348,12 @@ function listMarkdown(list, depth) {
   return lines.join("\n");
 }
 
+function textDisplayWidth(text) {
+  let width = 0;
+  for (const ch of text) width += /[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe6f\uff00-\uff60\uffe0-\uffe6]/.test(ch) ? 2 : 1;
+  return width;
+}
+
 function tableMarkdown(table) {
   const rows = [...table.querySelectorAll("tr")].map((row) => [...row.children].map((cell) => inlineMarkdown(cell).trim()));
   if (!rows.length) return "";
@@ -288,13 +367,21 @@ function tableMarkdown(table) {
     if (align === "left") return ":---";
     return "---";
   });
-  const format = (row) => "| " + Array.from({ length: columns }, (_, index) => row[index] || "").join(" | ") + " |";
+  // "格式化表格源码"标记过的表格按显示宽度补齐空格，让管道符上下对齐（中文按 2 列计）。
+  const widths = table.classList.contains("table-formatted")
+    ? Array.from({ length: columns }, (_, index) => Math.max(3, ...[header, divider, ...rows.slice(1)].map((row) => textDisplayWidth(row[index] || ""))))
+    : null;
+  const format = (row) => "| " + Array.from({ length: columns }, (_, index) => {
+    const text = row[index] || "";
+    return widths ? text + " ".repeat(Math.max(0, widths[index] - textDisplayWidth(text))) : text;
+  }).join(" | ") + " |";
   return [format(header), format(divider), ...rows.slice(1).map(format)].join("\n");
 }
 
 function blockMarkdown(node) {
   if (node.nodeType === Node.TEXT_NODE) return escapeText(node.nodeValue || "");
   if (node.nodeType !== Node.ELEMENT_NODE) return "";
+  if (node.classList.contains("front-matter")) return "";
   const tag = node.tagName;
   if (node.classList.contains("mermaid-block")) return BACKTICK.repeat(3) + "mermaid\n" + (node.dataset.markdownSource || "") + "\n" + BACKTICK.repeat(3);
   if (node.classList.contains("math-display")) return "$$\n" + (node.dataset.markdownMath || node.textContent) + "\n$$";
@@ -305,7 +392,7 @@ function blockMarkdown(node) {
     const code = node.querySelector("code");
     const languageClass = code ? [...code.classList].find((name) => name.startsWith("language-")) : null;
     const language = languageClass ? languageClass.slice(9) : "";
-    return BACKTICK.repeat(3) + language + "\n" + (code ? code.innerText : node.innerText).replace(/\n$/, "") + "\n" + BACKTICK.repeat(3);
+    return BACKTICK.repeat(3) + language + "\n" + (code ? codeLogicalText(code) : node.innerText.replace(/\n$/, "")) + "\n" + BACKTICK.repeat(3);
   }
   if (tag === "BLOCKQUOTE") {
     const quoted = serializeContainer(node);
@@ -370,10 +457,8 @@ async function canSwitchDocument() {
 }
 
 async function showDocument(file) {
-  activePath = file.path;
+  activePath = normalizeTreePath(file.path);
   activeLineEnding = file.lineEnding;
-  folderPath = activePath.replace(/[\\/][^\\/]+$/, "");
-  folderFilter = "";
   sourceMode = false;
   source.hidden = true;
   editor.hidden = false;
@@ -385,122 +470,213 @@ async function showDocument(file) {
   setDirty(false);
   activePanel = "files";
   showSidebar("files");
-  await refreshFolder(folderPath);
+  await revealFileInTree(file.path);
 }
 
-async function refreshFolder(path) {
-  try {
-    if (folderPath && path.toLocaleLowerCase() !== folderPath.toLocaleLowerCase()) folderFilter = "";
-    const listing = await invoke("list_folder", { path });
-    folderPath = listing.path;
-    folderRoot = listing.rootPath;
-    const panel = document.querySelector("#files-panel");
-    panel.replaceChildren();
-    const top = document.createElement("div");
-    top.className = "file-panel-top";
-    const choose = document.createElement("button");
-    choose.id = "open-folder";
-    choose.className = "open-folder-button";
-    choose.textContent = "打开文件夹…";
-    choose.addEventListener("click", chooseFolder);
-    const actions = document.createElement("div");
-    actions.className = "file-panel-actions";
-    actions.append(choose);
-    const atRoot = folderPath.toLocaleLowerCase() === folderRoot.toLocaleLowerCase();
-    const up = document.createElement("button");
-    up.className = "file-panel-icon-button";
-    up.textContent = "↑";
-    up.title = "返回上级目录";
-    up.disabled = atRoot;
-    up.addEventListener("click", () => refreshFolder(parentDirectory(folderPath)));
-    const refresh = document.createElement("button");
-    refresh.className = "file-panel-icon-button";
-    refresh.textContent = "↻";
-    refresh.title = "刷新目录";
-    refresh.addEventListener("click", () => refreshFolder(folderPath));
-    const copy = document.createElement("button");
-    copy.className = "file-panel-icon-button";
-    copy.textContent = "⧉";
-    copy.title = "复制完整路径";
-    copy.addEventListener("click", async () => {
-      try {
-        await navigator.clipboard.writeText(folderPath);
-        copy.title = "已复制";
-        setTimeout(() => { copy.title = "复制完整路径"; }, 1200);
-      } catch (_) { window.prompt("文件夹路径", folderPath); }
-    });
-    actions.append(up, refresh, copy);
-    const location = document.createElement("div");
-    location.className = "folder-location";
-    const folderName = folderPath.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || folderPath;
-    const title = document.createElement("strong");
-    title.textContent = folderName;
-    title.title = folderPath;
-    const pathLabel = document.createElement("button");
-    pathLabel.className = "folder-path";
-    pathLabel.textContent = folderPath;
-    pathLabel.title = "点击复制完整路径";
-    pathLabel.addEventListener("click", async () => {
-      try { await navigator.clipboard.writeText(folderPath); }
-      catch (_) { window.prompt("文件夹路径", folderPath); }
-    });
-    location.append(title, pathLabel);
-    const filter = document.createElement("input");
-    filter.className = "file-filter";
-    filter.type = "search";
-    filter.placeholder = "筛选文件…";
-    filter.setAttribute("aria-label", "筛选文件");
-    filter.value = folderFilter;
-    filter.addEventListener("input", () => {
-      folderFilter = filter.value;
-      list.querySelectorAll(".file-entry").forEach((row) => {
-        row.hidden = !row.dataset.name.toLocaleLowerCase().includes(folderFilter.toLocaleLowerCase());
-      });
-    });
-    top.append(actions, location, filter);
-    panel.append(top);
-    const list = document.createElement("div");
-    list.className = "file-list";
-    const summary = document.createElement("div");
-    summary.className = "file-list-summary";
-    summary.textContent = listing.entries.length + " 个项目";
-    list.append(summary);
-    if (listing.entries.length === 0) {
-      const empty = document.createElement("div");
-      empty.className = "sidebar-empty";
-      empty.textContent = "此文件夹没有子文件夹或 Markdown 文件";
-      list.append(empty);
+function normalizeTreePath(path) {
+  return String(path).replace(/^\\\\\?\\/, "");
+}
+
+function isWithinRoot(path) {
+  if (!folderRoot) return false;
+  const normalized = normalizeTreePath(path).toLocaleLowerCase();
+  const root = normalizeTreePath(folderRoot).toLocaleLowerCase().replace(/[\\/]+$/, "");
+  return normalized === root || normalized.startsWith(root + "\\") || normalized.startsWith(root + "/");
+}
+
+function makeTreeNode(entry, parent) {
+  const node = {
+    path: normalizeTreePath(entry.path),
+    name: entry.name,
+    isDirectory: Boolean(entry.isDirectory),
+    parent,
+    expanded: false,
+    loaded: false,
+    children: [],
+  };
+  treeNodes.set(node.path.toLocaleLowerCase(), node);
+  return node;
+}
+
+function forgetTreeSubtree(node) {
+  treeNodes.delete(node.path.toLocaleLowerCase());
+  node.children.forEach(forgetTreeSubtree);
+}
+
+async function loadChildren(node) {
+  const listing = await invoke("list_folder", { path: node.path });
+  const previous = new Map(node.children.map((child) => [child.path.toLocaleLowerCase(), child]));
+  forgetTreeSubtree(node);
+  node.children = listing.entries.map((entry) => {
+    const child = makeTreeNode(entry, node);
+    const before = previous.get(child.path.toLocaleLowerCase());
+    if (before?.expanded) child.expanded = true;
+    return child;
+  });
+  node.loaded = true;
+  treeNodes.set(node.path.toLocaleLowerCase(), node);
+  for (const child of node.children) {
+    if (child.expanded && !child.loaded) {
+      try { await loadChildren(child); }
+      catch (_) {}
     }
-    listing.entries.forEach((entry) => {
-      const button = document.createElement("button");
-      button.className = "file-entry" + (entry.isDirectory ? " directory" : "") + (entry.path === activePath ? " active" : "");
-      button.dataset.name = entry.name;
-      button.title = entry.path;
-      const icon = document.createElement("span");
-      icon.className = "file-entry-icon";
-      icon.textContent = entry.isDirectory ? "▸" : "▤";
-      icon.setAttribute("aria-hidden", "true");
-      const name = document.createElement("span");
-      name.className = "file-entry-name";
-      name.textContent = entry.name;
-      button.append(icon, name);
-      button.hidden = !entry.name.toLocaleLowerCase().includes(folderFilter.toLocaleLowerCase());
-      button.addEventListener("click", async () => {
-        if (entry.isDirectory) await refreshFolder(entry.path);
-        else if (await canSwitchDocument()) {
-          try {
-            const file = await invoke("open_document_by_path", { path: entry.path });
-            await invoke("clear_recovery_draft");
-            await showDocument(file);
-          }
-          catch (error) { window.alert(String(error)); }
-        }
-      });
-      list.append(button);
-    });
-    panel.append(list);
+  }
+}
+
+function nodeDepth(node) {
+  let depth = 0;
+  for (let parent = node.parent; parent; parent = parent.parent) depth += 1;
+  return depth;
+}
+
+function renderTreeNode(node) {
+  const depth = nodeDepth(node);
+  const row = document.createElement("div");
+  row.className = "file-library-node file-tree-node" + (node.isDirectory ? " directory" : " file")
+    + (node.expanded ? " expanded" : "")
+    + (node.path === activePath ? " active" : "")
+    + (node.path === selectedTreeNode?.path ? " selected" : "");
+  row.dataset.path = node.path;
+  row.dataset.isDirectory = String(node.isDirectory);
+  row.tabIndex = -1;
+
+  const content = document.createElement("div");
+  content.className = "file-node-content";
+  content.style.paddingLeft = (6 + depth * 13) + "px";
+
+  const openState = document.createElement("span");
+  openState.className = "file-node-open-state";
+  openState.textContent = node.isDirectory ? (node.expanded ? "▾" : "▸") : "";
+  const title = document.createElement("span");
+  title.className = "file-node-title";
+  title.textContent = node.name;
+  const renameInput = document.createElement("input");
+  renameInput.className = "file-tree-rename-input";
+  renameInput.type = "text";
+  renameInput.setAttribute("aria-label", "重命名");
+  content.append(openState, title, renameInput);
+
+  const children = document.createElement("div");
+  children.className = "file-node-children";
+
+  row.append(content, children);
+  treeElements.set(node.path.toLocaleLowerCase(), row);
+  if (node.expanded && node.loaded) {
+    node.children.forEach((child) => children.append(renderTreeNode(child)));
+  }
+  return row;
+}
+
+function renderNodeChildren(node) {
+  const row = treeElements.get(node.path.toLocaleLowerCase());
+  if (!row) return;
+  const container = row.querySelector(":scope > .file-node-children");
+  container.replaceChildren();
+  node.children.forEach((child) => container.append(renderTreeNode(child)));
+}
+
+function renderTree() {
+  const tree = document.querySelector("#file-library-tree");
+  tree.replaceChildren();
+  treeElements.clear();
+  if (!folderRoot || !treeRootNode) {
+    const empty = document.createElement("div");
+    empty.className = "sidebar-empty";
+    empty.textContent = "打开文件夹以浏览 Markdown 文档";
+    tree.append(empty);
+    return;
+  }
+  tree.append(renderTreeNode(treeRootNode));
+}
+
+async function mountFolder(path) {
+  folderRoot = normalizeTreePath(path);
+  treeNodes.clear();
+  treeElements.clear();
+  treeRootNode = makeTreeNode({ path, name: normalizeTreePath(path).replace(/[\\/]+$/, "").split(/[\\/]/).pop() || path, isDirectory: true }, null);
+  treeRootNode.expanded = true;
+  selectedTreeNode = null;
+  renderTree();
+  try {
+    await invoke("watch_folder", { path });
+    await loadChildren(treeRootNode);
+    renderTree();
   } catch (error) {
     window.alert(String(error));
+  }
+}
+
+async function expandNode(node) {
+  if (!node.isDirectory) return;
+  if (!node.loaded) {
+    try { await loadChildren(node); }
+    catch (error) { window.alert(String(error)); return; }
+  }
+  node.expanded = true;
+  const row = treeElements.get(node.path.toLocaleLowerCase());
+  if (row) {
+    row.classList.add("expanded");
+    row.querySelector(".file-node-open-state").textContent = "▾";
+  }
+  renderNodeChildren(node);
+}
+
+function collapseNode(node) {
+  node.expanded = false;
+  const row = treeElements.get(node.path.toLocaleLowerCase());
+  if (row) {
+    row.classList.remove("expanded");
+    row.querySelector(".file-node-open-state").textContent = "▸";
+    row.querySelector(":scope > .file-node-children").replaceChildren();
+  }
+}
+
+async function reloadDirectory(dirPath, options = {}) {
+  if (!dirPath) return;
+  const node = treeNodes.get(dirPath.toLocaleLowerCase());
+  if (!node || !node.isDirectory) return;
+  if (!node.expanded) {
+    if (options.forceExpand) await expandNode(node);
+    else node.loaded = false;
+    return;
+  }
+  try { await loadChildren(node); }
+  catch (_) { return; }
+  renderNodeChildren(node);
+  markActivePath();
+}
+
+function markActivePath() {
+  treeElements.forEach((row) => row.classList.toggle("active", row.dataset.path === activePath));
+}
+
+async function revealFileInTree(path) {
+  if (!path) return;
+  if (!folderRoot || !isWithinRoot(path)) {
+    await mountFolder(parentDirectory(normalizeTreePath(path)));
+  }
+  if (!treeRootNode) return;
+  const rootPath = normalizeTreePath(folderRoot).replace(/[\\/]+$/, "");
+  const parts = normalizeTreePath(path).slice(rootPath.length).split(/[\\/]+/).filter(Boolean);
+  let node = treeRootNode;
+  for (let index = 0; index < parts.length; index += 1) {
+    if (!node.loaded) {
+      try { await loadChildren(node); }
+      catch (_) { return; }
+    }
+    if (node.expanded) renderNodeChildren(node);
+    const child = node.children.find((candidate) => candidate.name === parts[index]);
+    if (!child) return;
+    if (index < parts.length - 1) child.expanded = true;
+    node = child;
+  }
+  selectedTreeNode = node;
+  const tree = document.querySelector("#file-library-tree");
+  const row = treeElements.get(node.path.toLocaleLowerCase());
+  if (row) {
+    tree.querySelectorAll(".file-library-node.selected").forEach((other) => other.classList.remove("selected"));
+    row.classList.add("selected", "active");
+    row.scrollIntoView({ block: "nearest" });
   }
 }
 
@@ -512,15 +688,390 @@ function parentDirectory(path) {
   return normalized.slice(0, separator) || normalized.slice(0, 1);
 }
 
+function selectTreeNode(node) {
+  selectedTreeNode = node;
+  const tree = document.querySelector("#file-library-tree");
+  tree.querySelectorAll(".file-library-node.selected").forEach((other) => other.classList.remove("selected"));
+  if (!node) return;
+  const row = treeElements.get(node.path.toLocaleLowerCase());
+  if (row) {
+    row.classList.add("selected");
+    row.scrollIntoView({ block: "nearest" });
+  }
+}
+
+function closeContextMenu() {
+  const menu = document.querySelector("#file-context-menu");
+  menu.hidden = true;
+  menu.replaceChildren();
+}
+
+function renderContextMenuEntries(container, items) {
+  items.forEach((item) => {
+    if (item === "-" || item.divider) {
+      const divider = document.createElement("div");
+      divider.className = "file-context-menu-divider";
+      container.append(divider);
+      return;
+    }
+    if (item.row) {
+      const row = document.createElement("div");
+      row.className = "file-context-menu-row";
+      item.row.forEach((entry) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "file-context-menu-row-button" + (entry.checked ? " checked" : "");
+        button.title = entry.title || entry.label;
+        button.textContent = entry.label;
+        if (entry.action && !entry.disabled) {
+          button.addEventListener("click", () => { closeContextMenu(); entry.action(); });
+        } else {
+          button.disabled = true;
+        }
+        row.append(button);
+      });
+      container.append(row);
+      return;
+    }
+    const entry = document.createElement("div");
+    entry.className = "file-context-menu-item"
+      + (item.destructive ? " destructive" : "")
+      + (item.disabled ? " disabled" : "")
+      + (item.checked ? " checked" : "")
+      + (item.children ? " has-extra-menu" : "");
+    entry.setAttribute("role", "menuitem");
+    const label = document.createElement("span");
+    label.className = "file-context-menu-label";
+    label.textContent = item.label;
+    entry.append(label);
+    if (item.shortcut) {
+      const shortcut = document.createElement("span");
+      shortcut.className = "file-context-menu-shortcut";
+      shortcut.textContent = item.shortcut;
+      entry.append(shortcut);
+    }
+    if (item.children) {
+      const caret = document.createElement("span");
+      caret.className = "file-context-menu-caret";
+      caret.textContent = "›";
+      entry.append(caret);
+      const submenu = document.createElement("div");
+      submenu.className = "file-context-menu-submenu";
+      renderContextMenuEntries(submenu, item.children);
+      entry.append(submenu);
+      entry.addEventListener("mouseenter", () => positionContextMenuSubmenu(entry, submenu));
+    } else if (item.action && !item.disabled) {
+      entry.addEventListener("click", () => { closeContextMenu(); item.action(); });
+    }
+    container.append(entry);
+  });
+}
+
+function positionContextMenuSubmenu(entry, submenu) {
+  submenu.classList.remove("flip-left");
+  submenu.style.top = "0px";
+  const rect = entry.getBoundingClientRect();
+  const box = submenu.getBoundingClientRect();
+  let offset = -5;
+  if (rect.top + offset + box.height > window.innerHeight - 8) {
+    offset = window.innerHeight - 8 - box.height - rect.top;
+  }
+  submenu.style.top = Math.max(offset, 4 - rect.top) + "px";
+  if (rect.right + box.width > window.innerWidth - 8) submenu.classList.add("flip-left");
+}
+
+function openContextMenu(x, y, items) {
+  const menu = document.querySelector("#file-context-menu");
+  menu.replaceChildren();
+  renderContextMenuEntries(menu, items);
+  menu.onmousedown = (event) => event.preventDefault();
+  menu.hidden = false;
+  const rect = menu.getBoundingClientRect();
+  menu.style.left = Math.max(4, Math.min(x, window.innerWidth - rect.width - 8)) + "px";
+  menu.style.top = Math.max(4, Math.min(y, window.innerHeight - rect.height - 8)) + "px";
+}
+
+function contextMenuItems(node) {
+  if (!node) {
+    const items = folderRoot
+      ? [
+          { label: "新建文件", action: () => void createTreeEntry("file") },
+          { label: "新建文件夹", action: () => void createTreeEntry("folder") },
+          { label: "刷新", action: () => { if (folderRoot) void reloadDirectory(folderRoot); } },
+          { label: "在资源管理器中显示", action: () => void revealTreeEntry(null) },
+        ]
+      : [];
+    items.push({ label: "打开文件夹…", action: () => void chooseFolder() });
+    return items;
+  }
+  if (node.isDirectory) {
+    const items = [
+      { label: "新建文件", action: () => { selectTreeNode(node); void createTreeEntry("file"); } },
+      { label: "新建文件夹", action: () => { selectTreeNode(node); void createTreeEntry("folder"); } },
+    ];
+    if (node.parent) {
+      items.push(
+        { label: "重命名", action: () => startInlineRename(node) },
+        { label: "复制文件夹路径", action: () => void copyTreePath(node) },
+        { label: "在资源管理器中显示", action: () => void revealTreeEntry(node) },
+        { label: "删除", destructive: true, action: () => void deleteTreeEntry(node) },
+      );
+    } else {
+      items.push(
+        { label: "复制文件夹路径", action: () => void copyTreePath(node) },
+        { label: "在资源管理器中显示", action: () => void revealTreeEntry(node) },
+      );
+    }
+    return items;
+  }
+  return [
+    { label: "打开", action: () => void openTreeFile(node) },
+    { label: "重命名", action: () => startInlineRename(node) },
+    { label: "复制文件", action: () => void duplicateTreeEntry(node) },
+    { label: "复制文件路径", action: () => void copyTreePath(node) },
+    { label: "在资源管理器中显示", action: () => void revealTreeEntry(node) },
+    { label: "删除", destructive: true, action: () => void deleteTreeEntry(node) },
+  ];
+}
+
+async function openTreeFile(node) {
+  if (!node || node.isDirectory) return;
+  if (!(await canSwitchDocument())) return;
+  try {
+    const file = await invoke("open_document_by_path", { path: node.path });
+    await invoke("clear_recovery_draft");
+    await showDocument(file);
+  } catch (error) { window.alert(String(error)); }
+}
+
+async function createTreeEntry(kind) {
+  if (!folderRoot) return;
+  const targetDir = selectedTreeNode
+    ? (selectedTreeNode.isDirectory ? selectedTreeNode.path : parentDirectory(selectedTreeNode.path))
+    : folderRoot;
+  try {
+    const created = await invoke("create_entry", { folder: targetDir, kind });
+    if (!created) return;
+    await reloadDirectory(targetDir, { forceExpand: true });
+    const node = treeNodes.get(normalizeTreePath(created.path).toLocaleLowerCase());
+    if (node) {
+      selectTreeNode(node);
+      if (!node.isDirectory) startInlineRename(node);
+    }
+  } catch (error) { window.alert(String(error)); }
+}
+
+function startInlineRename(node) {
+  if (!node || renamingPath) return;
+  const row = treeElements.get(node.path.toLocaleLowerCase());
+  const input = row?.querySelector(".file-tree-rename-input");
+  if (!row || !input) return;
+  renamingPath = node.path;
+  row.classList.add("file-node-on-edit");
+  selectTreeNode(node);
+  input.value = node.name;
+  const dot = node.name.lastIndexOf(".");
+  if (!node.isDirectory && dot > 0) input.setSelectionRange(0, dot);
+  else input.select();
+  input.focus();
+}
+
+function finishInlineRename(node) {
+  const row = treeElements.get(node.path.toLocaleLowerCase());
+  const input = row?.querySelector(".file-tree-rename-input");
+  const value = input ? input.value : "";
+  if (row) row.classList.remove("file-node-on-edit");
+  renamingPath = null;
+  return value;
+}
+
+async function commitInlineRename() {
+  if (!renamingPath) return;
+  const node = treeNodes.get(renamingPath.toLocaleLowerCase());
+  if (!node) { renamingPath = null; return; }
+  const newName = finishInlineRename(node).trim();
+  const oldPath = node.path;
+  const parentDir = parentDirectory(oldPath);
+  if (!newName || newName === node.name) { flushPendingFsEvents(); return; }
+  if (node.path === activePath && dirty) await saveDocument(false);
+  try {
+    const newPath = normalizeTreePath(await invoke("rename_entry", { path: oldPath, newName }));
+    treeNodes.delete(oldPath.toLocaleLowerCase());
+    node.path = newPath;
+    node.name = newName;
+    treeNodes.set(newPath.toLocaleLowerCase(), node);
+    const row = treeElements.get(oldPath.toLocaleLowerCase());
+    treeElements.delete(oldPath.toLocaleLowerCase());
+    if (row) {
+      treeElements.set(newPath.toLocaleLowerCase(), row);
+      row.dataset.path = newPath;
+      row.querySelector(".file-node-title").textContent = newName;
+    }
+    if (node.isDirectory && activePath) {
+      const oldLower = oldPath.toLocaleLowerCase();
+      const activeLower = activePath.toLocaleLowerCase();
+      if (activeLower === oldLower || activeLower.startsWith(oldLower + "\\") || activeLower.startsWith(oldLower + "/")) {
+        activePath = newPath + activePath.slice(oldPath.length);
+        try { await invoke("adopt_document_path", { path: activePath }); } catch (_) {}
+        setDirty(dirty);
+      }
+    } else if (node.path === activePath) {
+      activePath = newPath;
+      try { await invoke("adopt_document_path", { path: activePath }); } catch (_) {}
+      setDirty(dirty);
+    }
+    if (node.isDirectory) await reloadDirectory(parentDir, { forceExpand: true });
+    else markActivePath();
+  } catch (error) {
+    window.alert(String(error));
+    await reloadDirectory(parentDir);
+  }
+  flushPendingFsEvents();
+}
+
+function cancelInlineRename() {
+  if (!renamingPath) return;
+  const node = treeNodes.get(renamingPath.toLocaleLowerCase());
+  if (node) finishInlineRename(node);
+  flushPendingFsEvents();
+}
+
+async function duplicateTreeEntry(node) {
+  if (!node || node.isDirectory) return;
+  try {
+    const created = await invoke("duplicate_entry", { path: node.path });
+    if (created) await reloadDirectory(parentDirectory(node.path));
+  } catch (error) { window.alert(String(error)); }
+}
+
+async function deleteTreeEntry(node) {
+  if (!node || !node.parent) return;
+  if (!window.confirm(`确定将“${node.name}”移入回收站吗？`)) return;
+  try {
+    await invoke("trash_entry", { path: node.path });
+    await reloadDirectory(parentDirectory(node.path));
+  } catch (error) { window.alert(String(error)); }
+}
+
+async function revealTreeEntry(node) {
+  const target = node ? node.path : folderRoot;
+  if (!target) return;
+  try { await invoke("reveal_entry", { path: target }); }
+  catch (error) { window.alert(String(error)); }
+}
+
+async function copyTreePath(node) {
+  const target = node ? node.path : folderRoot;
+  if (!target) return;
+  try { await navigator.clipboard.writeText(normalizeTreePath(target)); }
+  catch (_) { window.alert("复制失败"); }
+}
+
+function handleFsChanges(changes) {
+  if (!folderRoot) return;
+  const directories = new Set();
+  changes.forEach((change) => {
+    const normalized = normalizeTreePath(change.path);
+    if (!isWithinRoot(normalized)) return;
+    const parent = parentDirectory(normalized);
+    directories.add(isWithinRoot(parent) ? parent.toLocaleLowerCase() : folderRoot.toLocaleLowerCase());
+  });
+  directories.forEach((key) => {
+    const node = treeNodes.get(key);
+    if (node) void reloadDirectory(node.path);
+  });
+}
+
+function queueFsChanges(changes) {
+  if (renamingPath) {
+    pendingFsEvents.push(...changes);
+    return;
+  }
+  handleFsChanges(changes);
+}
+
+function flushPendingFsEvents() {
+  const events = pendingFsEvents;
+  pendingFsEvents = [];
+  if (events.length && !renamingPath) handleFsChanges(events);
+}
+
+function bindTreeEvents() {
+  const tree = document.querySelector("#file-library-tree");
+
+  tree.addEventListener("click", (event) => {
+    if (event.target.closest(".file-tree-rename-input")) return;
+    const row = event.target.closest(".file-library-node");
+    if (!row) {
+      selectTreeNode(null);
+      return;
+    }
+    const node = treeNodes.get(row.dataset.path.toLocaleLowerCase());
+    if (!node) return;
+    selectTreeNode(node);
+    if (node.isDirectory) {
+      if (node.expanded) collapseNode(node);
+      else void expandNode(node);
+    } else {
+      void openTreeFile(node);
+    }
+  });
+
+  tree.addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+    const row = event.target.closest(".file-library-node");
+    const node = row?.dataset.path ? treeNodes.get(row.dataset.path.toLocaleLowerCase()) : null;
+    if (node) selectTreeNode(node);
+    openContextMenu(event.clientX, event.clientY, contextMenuItems(node));
+  });
+
+  tree.addEventListener("keydown", (event) => {
+    const input = event.target.closest?.(".file-tree-rename-input");
+    if (input) {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        void commitInlineRename();
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        cancelInlineRename();
+      }
+      return;
+    }
+    if (event.key === "Escape") {
+      closeContextMenu();
+      return;
+    }
+    if (renamingPath || !selectedTreeNode) return;
+    if (event.key === "F2") {
+      event.preventDefault();
+      startInlineRename(selectedTreeNode);
+    } else if (event.key === "Delete") {
+      event.preventDefault();
+      void deleteTreeEntry(selectedTreeNode);
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      if (selectedTreeNode.isDirectory) {
+        if (selectedTreeNode.expanded) collapseNode(selectedTreeNode);
+        else void expandNode(selectedTreeNode);
+      } else {
+        void openTreeFile(selectedTreeNode);
+      }
+    }
+  });
+
+  tree.addEventListener("focusout", (event) => {
+    if (renamingPath && event.target.closest?.(".file-tree-rename-input")) void commitInlineRename();
+  });
+}
+
+
 async function chooseFolder() {
   try {
     const listing = await invoke("choose_folder");
     if (!listing) return;
-    folderPath = listing.path;
-    folderFilter = "";
     activePanel = "files";
     showSidebar("files");
-    await refreshFolder(folderPath);
+    await mountFolder(listing.path);
   } catch (error) { window.alert(String(error)); }
 }
 
@@ -531,7 +1082,7 @@ async function saveDocument(saveAs) {
     const lineEnding = activePath ? activeLineEnding : preferences.defaultLineEnding;
     const path = await invoke("save_document", { content: markdown, saveAs: Boolean(saveAs), lineEnding });
     if (!path) return;
-    activePath = path;
+    activePath = normalizeTreePath(path);
     activeLineEnding = lineEnding;
     savedMarkdown = markdown;
     source.value = markdown;
@@ -737,6 +1288,11 @@ function editActiveTable(action) {
     const newRow = body.insertRow(Math.max(0, rowIndex));
     for (let index = 0; index < Math.max(1, row.cells.length); index += 1) newRow.insertCell().append(document.createElement("br"));
     nextCell = newRow.cells[Math.min(column, newRow.cells.length - 1)];
+  } else if (action === "add-row-above") {
+    const rowIndex = row.parentElement.tagName === "THEAD" ? 0 : Math.max(0, [...body.rows].indexOf(row));
+    const newRow = body.insertRow(rowIndex);
+    for (let index = 0; index < Math.max(1, row.cells.length); index += 1) newRow.insertCell().append(document.createElement("br"));
+    nextCell = newRow.cells[Math.min(column, newRow.cells.length - 1)];
   } else if (action === "delete-row") {
     if (row.parentElement.tagName === "THEAD") return;
     if (body.rows.length <= 1) {
@@ -754,17 +1310,56 @@ function editActiveTable(action) {
       tableRow.insertBefore(newCell, tableRow.cells[column + 1] || null);
       if (tableRow === row) nextCell = newCell;
     });
+  } else if (action === "add-column-left") {
+    [...table.rows].forEach((tableRow) => {
+      const newCell = document.createElement(tableRow.parentElement.tagName === "THEAD" ? "th" : "td");
+      newCell.append(document.createElement("br"));
+      tableRow.insertBefore(newCell, tableRow.cells[column] || null);
+      if (tableRow === row) nextCell = newCell;
+    });
   } else if (action === "delete-column") {
     const columns = Math.max(...[...table.rows].map((tableRow) => tableRow.cells.length));
     if (columns <= 1) return;
     [...table.rows].forEach((tableRow) => tableRow.cells[column]?.remove());
     nextCell = row.cells[Math.min(column, row.cells.length - 1)] || row.cells[row.cells.length - 1] || null;
+  } else if (action === "move-row-up" || action === "move-row-down") {
+    if (row.parentElement.tagName === "THEAD") return;
+    const rows = [...body.rows];
+    const index = rows.indexOf(row);
+    if (action === "move-row-up" && index > 0) row.parentNode.insertBefore(row, rows[index - 1]);
+    if (action === "move-row-down" && index < rows.length - 1) row.parentNode.insertBefore(rows[index + 1], row);
+  } else if (action === "move-col-left" || action === "move-col-right") {
+    const delta = action === "move-col-left" ? -1 : 1;
+    [...table.rows].forEach((tableRow) => {
+      const current = tableRow.cells[column];
+      const neighbor = tableRow.cells[column + delta];
+      if (!current || !neighbor) return;
+      tableRow.insertBefore(delta < 0 ? current : neighbor, delta < 0 ? neighbor : current);
+    });
+  } else if (action === "delete-table") {
+    table.remove();
+    if (!editor.firstElementChild) {
+      const paragraph = document.createElement("p");
+      paragraph.append(document.createElement("br"));
+      editor.append(paragraph);
+    }
+    placeCaretAtEnd(editor.lastElementChild || editor);
+    updateAfterEdit();
+    return;
   } else if (action.startsWith("align-")) {
     const align = action.slice(6);
     [...table.rows].forEach((tableRow) => { if (tableRow.cells[column]) tableRow.cells[column].style.textAlign = align; });
   }
   updateAfterEdit();
   if (nextCell) focusTableCell(nextCell);
+}
+
+function formatTableSource() {
+  const table = activeTableCell?.closest("table");
+  if (!table || !editor.contains(table)) return;
+  table.classList.add("table-formatted");
+  updateAfterEdit();
+  statusCenter.textContent = "表格源码已格式化";
 }
 
 function runWhenVisible(container, elements, action, eager) {
@@ -868,6 +1463,875 @@ function applyHeading(level) {
   updateAfterEdit();
 }
 
+async function copyTextToClipboard(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (_) {}
+  try {
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.style.cssText = "position:fixed;top:0;left:0;opacity:0";
+    document.body.append(textarea);
+    textarea.select();
+    const ok = document.execCommand("copy");
+    textarea.remove();
+    return ok;
+  } catch (_) { return false; }
+}
+
+function selectionRange() {
+  const selection = window.getSelection();
+  if (!selection?.rangeCount || selection.isCollapsed) return null;
+  return selection.getRangeAt(0);
+}
+
+const codeLanguages = ["js","javascript","java","json","typescript","ts","clojure","coffeescript","css","less","scss","gfm","markdown","xaml","xml","haskell","html","lua","lisp","commonlisp","pascal","perl","perl6","php","php+html","python","cython","ruby","shell","sh","sql","sqlite","mssql","mysql","cql","mariadb","cassandra","plsql","tiddlywiki","wiki","vb","basic","visual basic","vbscript","velocity","verilog","xquery","yaml","go","groovy","nginx","octave","c","clike","c++","cpp","objc","objective-c","csharp","c#","squirrel","ceylon","kotlin","tex","latex","swift","scala","r","d","diff","erlang","http","jade","rst","rust","jinja2","restructuredtext","asp","jsp","erb","ejs","embeddedjs","powershell","dockerfile","jsx","tsx","react","vue","nsis","mathematica","tiki wiki","properties","ini","livescript","assembly","gas","toml","matlab","ocaml","f#","fsharp","elm","pgp","asciiarmor","spreadsheet","elixir","cmake","cypher","dart","django","dtd","xml-dtd","dylan","handlebars","idl","web-idl","yacas","mbox","vhdl","julia","haxe","hxml","fortran","protobuf","makefile","tcl","scheme","twig","bash","sas","pseudocode","stylus","cobol","oz","sparql","crystal","asn.1","gherkin","smalltalk","turtle","glsl","apl","abap","q","v","forth","nim","solidity","htaccess","postgresql","hive","stata","systemverilog","smarty","yara","pug","svelte","pegjs","cmd","bat","modelica","structured text","url","mermaid"];
+let lastCodeLang = "";
+try { lastCodeLang = localStorage.getItem("typora-rs-last-code-lang") || ""; } catch (_) {}
+let activeLangPre = null;
+let langEditing = false;
+let langEditCaret = null;
+
+function rememberCodeLang(lang) {
+  lastCodeLang = lang;
+  try { localStorage.setItem("typora-rs-last-code-lang", lang); } catch (_) {}
+}
+
+function currentCodeBlock() {
+  if (sourceMode) return null;
+  const block = activeBlock();
+  if (!block || block.tagName !== "PRE" || !editor.contains(block)) return null;
+  const code = block.querySelector("code");
+  if (!code || code.classList.contains("language-mermaid")) return null;
+  return block;
+}
+
+function codeLanguageOf(code) {
+  return [...code.classList].find((name) => name.startsWith("language-"))?.slice(9) || "";
+}
+
+function codeNormalizedText(code) {
+  let text = "";
+  const walk = (node) => {
+    if (node.nodeType === Node.TEXT_NODE) { text += node.textContent; return; }
+    if (node.nodeName === "BR") { text += "\n"; return; }
+    [...node.childNodes].forEach(walk);
+  };
+  walk(code);
+  return text;
+}
+
+function codeLogicalText(code) {
+  // The empty-block placeholder is a lone <br>, which normalizes to "\n" but
+  // renders as a single line; map it back to the empty string.
+  const text = codeNormalizedText(code);
+  return text === "\n" && !code.textContent ? "" : text;
+}
+
+function lineColOfText(text, offset) {
+  const lines = text.slice(0, offset).split("\n");
+  return { line: lines.length - 1, ch: lines[lines.length - 1].length };
+}
+
+function codeAbsoluteOffset(code, container, offset) {
+  let total = 0;
+  const stopped = { value: false };
+  const walk = (node) => {
+    if (stopped.value) return;
+    if (node === container) {
+      if (node.nodeType === Node.TEXT_NODE) total += offset;
+      else [...node.childNodes].slice(0, offset).forEach(walk);
+      stopped.value = true;
+      return;
+    }
+    if (node.nodeType === Node.TEXT_NODE) { total += node.textContent.length; return; }
+    if (node.nodeName === "BR") { total += 1; return; }
+    [...node.childNodes].forEach(walk);
+  };
+  walk(code);
+  return stopped.value ? total : null;
+}
+
+function codeOffsetToPosition(code, absoluteOffset) {
+  let remaining = absoluteOffset;
+  const find = (node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      if (remaining <= node.textContent.length) return { node, offset: remaining };
+      remaining -= node.textContent.length;
+      return null;
+    }
+    if (node.nodeName === "BR") {
+      if (remaining === 0) return { before: node };
+      remaining -= 1;
+      return null;
+    }
+    for (const child of [...node.childNodes]) {
+      const hit = find(child);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  return find(code);
+}
+
+function placeCaretInCode(code, absoluteOffset, endOffset) {
+  editor.focus();
+  const range = document.createRange();
+  const start = codeOffsetToPosition(code, absoluteOffset);
+  if (start?.before) range.setStartBefore(start.before);
+  else if (start) range.setStart(start.node, start.offset);
+  else { range.selectNodeContents(code); range.collapse(false); }
+  if (endOffset != null && endOffset !== absoluteOffset) {
+    const end = codeOffsetToPosition(code, endOffset);
+    if (end?.before) range.setEndBefore(end.before);
+    else if (end) range.setEnd(end.node, end.offset);
+    else if (code.lastChild) range.setEndAfter(code.lastChild);
+  } else range.collapse(true);
+  const selection = window.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
+
+function setCodeText(code, text) {
+  if (text) code.textContent = text;
+  else code.innerHTML = "<br>";
+}
+
+function rehighlightCode(code) {
+  code.removeAttribute("data-highlighted");
+  if (window.hljs && !code.classList.contains("language-mermaid")) {
+    try { window.hljs.highlightElement(code); } catch (_) {}
+  }
+}
+
+function updateCodeGutter(pre) {
+  if (!pre || !preferences.codeLineNumbers) return;
+  const code = pre.querySelector("code");
+  if (!code || code.classList.contains("language-mermaid")) return;
+  let gutter = pre.querySelector(".code-gutter");
+  if (!gutter) {
+    gutter = document.createElement("span");
+    gutter.className = "code-gutter";
+    gutter.setAttribute("aria-hidden", "true");
+    pre.classList.add("numbered-code");
+    pre.insertBefore(gutter, code);
+  }
+  const lineCount = Math.max(1, codeLogicalText(code).split("\n").length);
+  const text = Array.from({ length: lineCount }, (_, index) => String(index + 1)).join("\n");
+  if (gutter.textContent !== text) gutter.textContent = text;
+}
+
+function applyCodeLanguage(pre, rawLang) {
+  const code = pre.querySelector("code");
+  if (!code) return false;
+  const lang = (rawLang || "").trim().split(/\s+/)[0] || "";
+  if (lang === codeLanguageOf(code)) return false;
+  code.className = lang ? "language-" + lang : "";
+  setCodeText(code, codeLogicalText(code));
+  rehighlightCode(code);
+  updateCodeGutter(pre);
+  if (lang) rememberCodeLang(lang);
+  updateAfterEdit();
+  return true;
+}
+
+let codeComposing = false;
+let rehighlightTimer = null;
+
+function scheduleCodeRehighlight(code) {
+  if (!code || code.classList.contains("language-mermaid") || !window.hljs) return;
+  clearTimeout(rehighlightTimer);
+  rehighlightTimer = setTimeout(() => {
+    if (codeComposing || !editor.contains(code) || !codeLogicalText(code).trim()) return;
+    const selection = window.getSelection();
+    const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+    const startOffset = range && code.contains(range.startContainer)
+      ? codeAbsoluteOffset(code, range.startContainer, range.startOffset) : null;
+    const endOffset = range && !range.collapsed && code.contains(range.endContainer)
+      ? codeAbsoluteOffset(code, range.endContainer, range.endOffset) : null;
+    rehighlightCode(code);
+    if (startOffset != null) placeCaretInCode(code, startOffset, endOffset ?? undefined);
+  }, 160);
+}
+
+function showCodeLangTooltip(pre) {
+  updateCodeGutter(pre);
+  if (langEditing) {
+    if (activeLangPre !== pre) finishLangEdit(true, false);
+    else { positionCodeLangTooltip(pre); return; }
+  }
+  activeLangPre = pre;
+  const value = codeLanguageOf(pre.querySelector("code"));
+  const label = codeLangTooltip.querySelector(".code-lang-value");
+  label.textContent = value || "代码语言";
+  codeLangTooltip.classList.toggle("empty", !value);
+  codeLangTooltip.hidden = false;
+  positionCodeLangTooltip(pre);
+}
+
+function hideCodeLangTooltip() {
+  codeLangTooltip.hidden = true;
+}
+
+function positionCodeLangTooltip(pre) {
+  if (!pre || codeLangTooltip.hidden) return;
+  const bounds = pre.getBoundingClientRect();
+  codeLangTooltip.style.left = Math.max(8, bounds.right - codeLangTooltip.offsetWidth - 10) + "px";
+  codeLangTooltip.style.top = Math.max(4, Math.min(bounds.bottom + 6, innerHeight - codeLangTooltip.offsetHeight - 8)) + "px";
+}
+
+function renderLangSuggestions(query) {
+  const list = codeLangTooltip.querySelector(".code-lang-list");
+  if (!list) return;
+  const needle = query.trim().toLowerCase();
+  const matches = needle ? codeLanguages.filter((name) => name.toLowerCase().startsWith(needle)) : codeLanguages;
+  list.replaceChildren(...matches.slice(0, 9).map((name) => {
+    const item = document.createElement("li");
+    item.textContent = name;
+    item.addEventListener("mousedown", (event) => event.preventDefault());
+    item.addEventListener("click", () => {
+      const input = codeLangTooltip.querySelector(".code-lang-input");
+      if (input) input.value = name;
+      finishLangEdit(true, true);
+    });
+    return item;
+  }));
+}
+
+function setActiveLangSuggestion(items, index) {
+  items.forEach((item, position) => item.classList.toggle("active", position === index));
+  items[index]?.scrollIntoView({ block: "nearest" });
+}
+
+function beginLangEdit() {
+  const pre = activeLangPre;
+  if (!pre || langEditing) return;
+  const code = pre.querySelector("code");
+  langEditing = true;
+  const selection = window.getSelection();
+  const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+  langEditCaret = range && code.contains(range.startContainer)
+    ? codeAbsoluteOffset(code, range.startContainer, range.startOffset)
+    : null;
+  const input = document.createElement("input");
+  input.className = "code-lang-input";
+  input.value = codeLanguageOf(code);
+  input.placeholder = "代码语言";
+  input.setAttribute("spellcheck", "false");
+  const list = document.createElement("ul");
+  list.className = "code-lang-list";
+  codeLangTooltip.replaceChildren(input, list);
+  codeLangTooltip.classList.add("editing");
+  positionCodeLangTooltip(pre);
+  input.addEventListener("input", () => renderLangSuggestions(input.value));
+  input.addEventListener("keydown", (event) => {
+    const items = [...codeLangTooltip.querySelectorAll(".code-lang-list li")];
+    const index = items.findIndex((item) => item.classList.contains("active"));
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      setActiveLangSuggestion(items, index < 0 ? 0 : Math.min(index + 1, items.length - 1));
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      if (index > 0) setActiveLangSuggestion(items, index - 1);
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      if (index >= 0) input.value = items[index].textContent;
+      finishLangEdit(true, true);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      finishLangEdit(false, true);
+    }
+  });
+  input.addEventListener("blur", () => { if (langEditing) finishLangEdit(true, false); });
+  input.focus();
+  input.select();
+  renderLangSuggestions(input.value);
+}
+
+function finishLangEdit(apply, restoreCaret) {
+  const pre = activeLangPre;
+  const input = codeLangTooltip.querySelector(".code-lang-input");
+  langEditing = false;
+  const label = document.createElement("span");
+  label.className = "code-lang-value";
+  codeLangTooltip.replaceChildren(label);
+  codeLangTooltip.classList.remove("editing");
+  if (pre && editor.contains(pre)) {
+    const code = pre.querySelector("code");
+    const selection = window.getSelection();
+    const anchor = selection?.anchorNode;
+    let clickOffset = null;
+    if (anchor && code?.contains(anchor) && selection.rangeCount) {
+      const range = selection.getRangeAt(0);
+      clickOffset = codeAbsoluteOffset(code, range.startContainer, range.startOffset);
+    }
+    const changed = apply && input ? applyCodeLanguage(pre, input.value) : false;
+    if (code) {
+      if (changed && clickOffset != null) placeCaretInCode(code, Math.min(clickOffset, codeNormalizedText(code).length));
+      else if (restoreCaret) {
+        const textLength = codeNormalizedText(code).length;
+        placeCaretInCode(code, Math.min(langEditCaret ?? textLength, textLength));
+      }
+    }
+  }
+  if (pre && editor.contains(pre) && currentCodeBlock() === pre) showCodeLangTooltip(pre);
+  else { activeLangPre = null; hideCodeLangTooltip(); }
+}
+
+function nearestSiblingBlock(node, direction) {
+  let element = node;
+  while (element && element !== editor) {
+    const sibling = direction === "up" ? element.previousElementSibling : element.nextElementSibling;
+    if (sibling) {
+      let target = sibling;
+      for (;;) {
+        if (/^(UL|OL)$/.test(target.tagName)) target = direction === "up" ? target.lastElementChild : target.firstElementChild;
+        else if (target.tagName === "BLOCKQUOTE") target = direction === "up" ? target.lastElementChild : target.firstElementChild;
+        else if (target.tagName === "TABLE") {
+          target = direction === "up"
+            ? target.querySelector("tbody tr:last-of-type td:last-of-type, tbody tr:last-of-type th:last-of-type")
+            : target.querySelector("thead th, tbody td, tbody th") || target.querySelector("tr td, tr th");
+        } else break;
+        if (!target) return null;
+      }
+      return target;
+    }
+    element = element.parentElement;
+  }
+  return null;
+}
+
+function exitCodeBlock(code, direction) {
+  const pre = code.closest("pre");
+  if (!pre) return;
+  const target = nearestSiblingBlock(pre, direction);
+  if (target) {
+    if (direction === "up") placeCaretAtEnd(target);
+    else placeCaretAtStart(target);
+  } else {
+    const paragraph = document.createElement("p");
+    paragraph.append(document.createElement("br"));
+    if (direction === "up") pre.before(paragraph);
+    else pre.after(paragraph);
+    placeCaretAtEnd(paragraph);
+  }
+  updateAfterEdit();
+}
+
+function moveCodeLine(code, delta) {
+  const selection = window.getSelection();
+  const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+  if (!range || !code.contains(range.startContainer)) return;
+  const startOffset = codeAbsoluteOffset(code, range.startContainer, range.startOffset);
+  const endOffset = range.collapsed ? startOffset : codeAbsoluteOffset(code, range.endContainer, range.endOffset);
+  if (startOffset == null || endOffset == null) return;
+  const text = codeLogicalText(code);
+  const lines = text.split("\n");
+  const startPos = lineColOfText(text, startOffset);
+  const endPos = lineColOfText(text, endOffset);
+  const firstLine = Math.min(startPos.line, endPos.line);
+  const lastLine = Math.max(startPos.line, endPos.line);
+  if (delta < 0 ? firstLine === 0 : lastLine === lines.length - 1) return;
+  const moving = lines.splice(firstLine, lastLine - firstLine + 1);
+  lines.splice(delta < 0 ? firstLine - 1 : firstLine + 1, 0, ...moving);
+  setCodeText(code, lines.join("\n"));
+  rehighlightCode(code);
+  updateCodeGutter(code.closest("pre"));
+  const lineOffset = (line) => (line > 0 ? lines.slice(0, line).join("\n").length + 1 : 0);
+  const newStartOffset = lineOffset(startPos.line + delta) + startPos.ch;
+  const newEndOffset = endOffset === startOffset ? null : lineOffset(endPos.line + delta) + endPos.ch;
+  placeCaretInCode(code, newStartOffset, newEndOffset);
+  updateAfterEdit();
+}
+
+function createCodeBlockFromParagraph(paragraph) {
+  const pre = document.createElement("pre");
+  const code = document.createElement("code");
+  if (lastCodeLang) code.className = "language-" + lastCodeLang;
+  code.innerHTML = "<br>";
+  pre.append(code);
+  paragraph.replaceWith(pre);
+  if (lastCodeLang) rehighlightCode(code);
+  updateCodeGutter(pre);
+  placeCaretAtStart(code);
+  updateAfterEdit();
+}
+
+function escapeHtmlCode(value) {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+async function copyRichTextToClipboard(plain, html) {
+  try {
+    if (navigator.clipboard?.write && window.ClipboardItem) {
+      await navigator.clipboard.write([new ClipboardItem({
+        "text/plain": new Blob([plain], { type: "text/plain" }),
+        "text/html": new Blob([html], { type: "text/html" })
+      })]);
+      return true;
+    }
+  } catch (_) {}
+  return copyTextToClipboard(plain);
+}
+
+function selectionFragmentContainer() {
+  const range = selectionRange();
+  if (!range) return null;
+  const container = document.createElement("div");
+  container.append(range.cloneContents());
+  return container;
+}
+
+function selectionMarkdown() {
+  const range = selectionRange();
+  if (!range) return "";
+  const container = selectionFragmentContainer();
+  const hasBlock = [...container.children].some((child) => /^(P|H[1-6]|LI|UL|OL|PRE|TABLE|BLOCKQUOTE|DIV)$/.test(child.tagName));
+  if (hasBlock) return serializeContainer(container);
+  const root = range.commonAncestorContainer.nodeType === Node.ELEMENT_NODE ? range.commonAncestorContainer : range.commonAncestorContainer.parentElement;
+  const blockRoot = root ? root.closest("p,h1,h2,h3,h4,h5,h6,li,pre,blockquote,table") : null;
+  if (blockRoot && editor.contains(blockRoot)) {
+    const selected = range.toString().replace(/\s+/g, " ").trim();
+    const whole = (blockRoot.innerText || blockRoot.textContent || "").replace(/\s+/g, " ").trim();
+    if (selected && selected === whole) {
+      return blockMarkdown(blockRoot.tagName === "LI" ? blockRoot.parentElement : blockRoot);
+    }
+  }
+  return inlineMarkdown(container);
+}
+
+function selectionHtml() {
+  const container = selectionFragmentContainer();
+  return container ? container.innerHTML : "";
+}
+
+function sanitizePastedHtml(html) {
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  template.content.querySelectorAll("script,style,iframe,object,embed,link,meta,form").forEach((node) => node.remove());
+  template.content.querySelectorAll("*").forEach((element) => {
+    [...element.attributes].forEach((attribute) => {
+      const name = attribute.name.toLowerCase();
+      if (name.startsWith("on")) element.removeAttribute(attribute.name);
+      if ((name === "href" || name === "src") && /^\s*javascript:/i.test(attribute.value)) element.removeAttribute(attribute.name);
+    });
+  });
+  return template.innerHTML;
+}
+
+async function readClipboardText() {
+  try { return await navigator.clipboard.readText(); } catch (_) { return null; }
+}
+
+async function readClipboardHtml() {
+  try {
+    const items = await navigator.clipboard.read();
+    for (const item of items) {
+      if (item.types.includes("text/html")) return await (await item.getType("text/html")).text();
+    }
+  } catch (_) {}
+  return null;
+}
+
+async function pasteIntoEditor(plainText) {
+  editor.focus();
+  if (!window.getSelection()?.rangeCount) return;
+  if (plainText) {
+    const text = await readClipboardText();
+    if (text === null) { window.alert("无法读取剪贴板内容"); return; }
+    document.execCommand("insertText", false, text);
+    updateAfterEdit();
+    return;
+  }
+  const html = await readClipboardHtml();
+  if (html !== null) {
+    document.execCommand("insertHTML", false, sanitizePastedHtml(html));
+    updateAfterEdit();
+    return;
+  }
+  const text = await readClipboardText();
+  if (text === null) { window.alert("无法读取剪贴板内容"); return; }
+  document.execCommand("insertText", false, text);
+  updateAfterEdit();
+}
+
+function toggleInlineCode() {
+  editor.focus();
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed) return;
+  document.execCommand("insertHTML", false, "<code>" + escapeAttribute(selection.toString()) + "</code>");
+  updateAfterEdit();
+}
+
+function toggleBlockquote() {
+  editor.focus();
+  const quote = activeBlock()?.closest("blockquote");
+  if (quote) {
+    const fragment = document.createDocumentFragment();
+    while (quote.firstChild) fragment.append(quote.firstChild);
+    quote.replaceWith(fragment);
+  } else {
+    document.execCommand("formatBlock", false, "BLOCKQUOTE");
+  }
+  updateAfterEdit();
+}
+
+function toggleTaskList() {
+  editor.focus();
+  const item = activeBlock()?.closest("li");
+  const attachCheckbox = (listItem) => {
+    const created = document.createElement("input");
+    created.type = "checkbox";
+    created.addEventListener("change", updateAfterEdit);
+    listItem.insertBefore(created, listItem.firstChild);
+  };
+  if (item) {
+    const checkbox = item.querySelector(":scope > input[type=checkbox]");
+    if (checkbox) checkbox.remove();
+    else attachCheckbox(item);
+    updateAfterEdit();
+    return;
+  }
+  document.execCommand("insertUnorderedList");
+  const newItem = activeBlock()?.closest("li");
+  if (newItem && !newItem.querySelector(":scope > input[type=checkbox]")) attachCheckbox(newItem);
+  updateAfterEdit();
+}
+
+function indentList(outdent) {
+  editor.focus();
+  document.execCommand(outdent ? "outdent" : "indent");
+  updateAfterEdit();
+}
+
+function insertHorizontalRule() {
+  editor.focus();
+  document.execCommand("insertHorizontalRule");
+  let node = window.getSelection()?.anchorNode;
+  if (node?.nodeType === Node.TEXT_NODE) node = node.parentElement;
+  const rule = node?.closest?.("hr");
+  if (rule) {
+    const paragraph = document.createElement("p");
+    paragraph.append(document.createElement("br"));
+    rule.after(paragraph);
+    placeCaretAtStart(paragraph);
+  }
+  updateAfterEdit();
+}
+
+function insertCodeBlock() {
+  editor.focus();
+  const language = lastCodeLang ? ' class="language-' + lastCodeLang + '"' : "";
+  document.execCommand("insertHTML", false, "<pre><code" + language + "><br></code></pre><p><br></p>");
+  const node = window.getSelection()?.anchorNode;
+  const element = node?.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+  const code = element?.closest?.("pre code");
+  if (code) {
+    if (lastCodeLang) rehighlightCode(code);
+    updateCodeGutter(code.closest("pre"));
+  }
+  updateAfterEdit();
+}
+
+function insertMathBlock() {
+  const tex = window.prompt("LaTeX 公式", "E = mc^2");
+  if (tex === null) return;
+  editor.focus();
+  const math = document.createElement("div");
+  math.className = "math-display";
+  math.contentEditable = "false";
+  math.dataset.markdownMath = tex;
+  let node = window.getSelection()?.anchorNode;
+  if (node?.nodeType === Node.TEXT_NODE) node = node.parentElement;
+  let topLevel = null;
+  if (node && editor.contains(node)) {
+    topLevel = node;
+    while (topLevel.parentElement && topLevel.parentElement !== editor) topLevel = topLevel.parentElement;
+  }
+  const paragraph = document.createElement("p");
+  paragraph.append(document.createElement("br"));
+  if (topLevel && topLevel.tagName === "P" && !topLevel.textContent.trim()) topLevel.replaceWith(math);
+  else if (topLevel) topLevel.after(math);
+  else editor.append(math);
+  math.after(paragraph);
+  if (window.katex) {
+    window.katex.render(tex, math, { displayMode: true, throwOnError: false, strict: "ignore" });
+  } else {
+    math.textContent = tex;
+  }
+  placeCaretAtStart(paragraph);
+  updateAfterEdit();
+}
+
+function deleteActiveBlock() {
+  editor.focus();
+  let node = window.getSelection()?.anchorNode;
+  if (node?.nodeType === Node.TEXT_NODE) node = node.parentElement;
+  if (!node || !editor.contains(node)) return;
+  const item = node.closest("li");
+  if (item) {
+    const list = item.parentElement;
+    item.remove();
+    if (list && !list.querySelector("li")) list.remove();
+  } else if (node.closest("table")) {
+    node.closest("table").remove();
+  } else {
+    let target = node.closest("p,h1,h2,h3,h4,h5,h6,pre,blockquote,.math-display,.mermaid-block,hr,img");
+    if (!target || target === editor) return;
+    const quote = target.closest("blockquote");
+    if (quote) target = quote;
+    target.remove();
+  }
+  if (!editor.firstElementChild) {
+    const paragraph = document.createElement("p");
+    paragraph.append(document.createElement("br"));
+    editor.append(paragraph);
+  }
+  placeCaretAtEnd(editor.lastElementChild || editor);
+  updateAfterEdit();
+}
+
+function contextAnchorElement() {
+  let node = window.getSelection()?.anchorNode;
+  if (node?.nodeType === Node.TEXT_NODE) node = node.parentElement;
+  return node && editor.contains(node) ? node : null;
+}
+
+function contextClosest(selector) {
+  return contextAnchorElement()?.closest?.(selector) || null;
+}
+
+async function copyAsPlainText() {
+  await copyTextToClipboard(window.getSelection()?.toString() ?? "");
+}
+
+async function copyAsMarkdown() {
+  await copyTextToClipboard(selectionMarkdown());
+}
+
+async function copyAsHtmlCode() {
+  await copyTextToClipboard(selectionHtml());
+}
+
+async function copyCodeContent() {
+  const code = contextClosest("pre")?.querySelector("code");
+  if (!code) return;
+  const plain = codeLogicalText(code);
+  const html = "<pre lang='" + codeLanguageOf(code) + "'>" + escapeHtmlCode(plain) + "</pre>";
+  await copyRichTextToClipboard(plain, html);
+}
+
+async function copyTableMarkdown() {
+  const table = contextClosest("table");
+  if (!table) return;
+  await copyTextToClipboard(tableMarkdown(table));
+}
+
+async function openLinkUrl(url) {
+  try { await invoke("open_url", { url }); }
+  catch (error) { window.alert(String(error)); }
+}
+
+function openContextLink() {
+  const href = contextClosest("a")?.getAttribute("href") || "";
+  if (href) void openLinkUrl(href);
+}
+
+async function copyContextLinkAddress() {
+  const href = contextClosest("a")?.getAttribute("href") || "";
+  if (href) await copyTextToClipboard(href);
+}
+
+async function searchSelectedWithGoogle() {
+  const text = window.getSelection()?.toString().trim() ?? "";
+  if (!text) return;
+  await openLinkUrl("https://www.google.com/search?q=" + encodeURIComponent(text));
+}
+
+async function copyImageContent() {
+  const image = contextClosest("img");
+  const src = image?.getAttribute("src");
+  if (!src) return;
+  try {
+    const blob = await (await fetch(src)).blob();
+    if (!navigator.clipboard?.write || !window.ClipboardItem) {
+      window.alert("当前环境不支持复制图片");
+      return;
+    }
+    await navigator.clipboard.write([new ClipboardItem({ [blob.type || "image/png"]: blob })]);
+  } catch (error) {
+    window.alert("复制图片失败：" + String(error));
+  }
+}
+
+async function copyImageAsMarkdown() {
+  const image = contextClosest("img");
+  if (!image) return;
+  const alt = image.getAttribute("alt") || "";
+  const url = image.dataset.markdownSrc || image.getAttribute("src") || "";
+  await copyTextToClipboard("![" + alt + "](" + url + ")");
+}
+
+async function copyMathSource() {
+  const math = contextClosest(".math-display,.math-inline");
+  if (!math) return;
+  await copyTextToClipboard(math.dataset.markdownMath || math.textContent || "");
+}
+
+async function copyDiagramSource() {
+  const diagram = contextClosest(".mermaid-block");
+  if (!diagram) return;
+  await copyTextToClipboard(diagram.dataset.markdownSource || diagram.textContent || "");
+}
+
+function collapseCaretToClick(event) {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed || !selection.rangeCount) return;
+  const range = selection.getRangeAt(0);
+  for (const rect of range.getClientRects()) {
+    if (event.clientX >= rect.left && event.clientX <= rect.right && event.clientY >= rect.top && event.clientY <= rect.bottom) return;
+  }
+  const caret = document.caretRangeFromPoint(event.clientX, event.clientY);
+  if (!caret || !editor.contains(caret.startContainer)) return;
+  const collapsed = document.createRange();
+  collapsed.setStart(caret.startContainer, caret.startOffset);
+  collapsed.collapse(true);
+  selection.removeAllRanges();
+  selection.addRange(collapsed);
+}
+
+function blockDeleteLabel(block) {
+  if (!block) return "";
+  const tag = block.tagName;
+  if (/^H[1-6]$/.test(tag)) return "标题 " + tag[1];
+  if (tag === "PRE") return "代码块";
+  if (tag === "TABLE") return "表格";
+  if (tag === "LI") return "列表项";
+  if (tag === "BLOCKQUOTE" || (block.closest && block.closest("blockquote"))) return "引用";
+  if (tag === "P") return "段落";
+  return "";
+}
+
+function buildTableMenuItems() {
+  return [
+    { label: "上方插入行", action: () => editActiveTable("add-row-above") },
+    { label: "下方插入行", shortcut: "Ctrl+Enter", action: () => editActiveTable("add-row") },
+    { label: "左侧插入列", action: () => editActiveTable("add-column-left") },
+    { label: "右侧插入列", action: () => editActiveTable("add-column") },
+    "-",
+    { label: "上移该行", shortcut: "Alt+↑", action: () => editActiveTable("move-row-up") },
+    { label: "下移该行", shortcut: "Alt+↓", action: () => editActiveTable("move-row-down") },
+    { label: "左移该列", shortcut: "Alt+←", action: () => editActiveTable("move-col-left") },
+    { label: "右移该列", shortcut: "Alt+→", action: () => editActiveTable("move-col-right") },
+    "-",
+    { label: "删除行", shortcut: "Ctrl+Shift+⌫", action: () => editActiveTable("delete-row") },
+    { label: "删除列", action: () => editActiveTable("delete-column") },
+    "-",
+    { label: "复制表格", action: () => void copyTableMarkdown() },
+    { label: "格式化表格源码", action: () => formatTableSource() },
+    { label: "删除表格", destructive: true, action: () => editActiveTable("delete-table") },
+  ];
+}
+
+function buildEditorContextMenu(target) {
+  const selection = window.getSelection();
+  const hasSelection = Boolean(selection && !selection.isCollapsed && selection.toString().trim());
+  let probe = target?.nodeType === Node.TEXT_NODE ? target.parentElement : target;
+  if (!probe || !editor.contains(probe)) probe = contextAnchorElement();
+  const anchor = contextAnchorElement();
+  const closest = (selector) => probe?.closest?.(selector) || anchor?.closest?.(selector) || null;
+  const block = closest("p,h1,h2,h3,h4,h5,h6,li,pre,blockquote,table");
+  const cell = closest("td,th");
+  const pre = closest("pre");
+  const link = closest("a");
+  const image = closest("img");
+  const math = closest(".math-display,.math-inline");
+  const diagram = closest(".mermaid-block");
+  const listItem = closest("li");
+  const inTable = Boolean(cell);
+  const items = [];
+
+  items.push({ row: [
+    { label: "剪切", title: "剪切 (Ctrl+X)", action: () => document.execCommand("cut"), disabled: !hasSelection },
+    { label: "复制", title: "复制 (Ctrl+C)", action: () => document.execCommand("copy"), disabled: !hasSelection },
+    { label: "粘贴", title: "粘贴 (Ctrl+V)", action: () => void pasteIntoEditor(false) },
+    { label: "删除", title: "删除所选", action: () => document.execCommand("delete"), disabled: !hasSelection },
+  ] });
+  if (hasSelection) {
+    items.push(
+      "-",
+      { label: "复制为", children: [
+        { label: "复制为 Markdown", action: () => void copyAsMarkdown() },
+        { label: "复制为 HTML 代码", action: () => void copyAsHtmlCode() },
+        { label: "复制为纯文本", action: () => void copyAsPlainText() },
+        "-",
+        { label: "粘贴为纯文本", shortcut: "Ctrl+Shift+V", action: () => void pasteIntoEditor(true) },
+      ] },
+      { label: "用 Google 搜索", action: () => void searchSelectedWithGoogle() },
+    );
+  }
+  items.push("-", { label: "全选", shortcut: "Ctrl+A", action: () => { editor.focus(); document.execCommand("selectAll"); } });
+  if (hasSelection && !inTable) {
+    items.push("-", { row: [
+      { label: "B", title: "加粗 (Ctrl+B)", action: () => document.execCommand("bold") },
+      { label: "I", title: "斜体 (Ctrl+I)", action: () => document.execCommand("italic") },
+      { label: "S", title: "删除线", action: () => document.execCommand("strikeThrough") },
+      { label: "<>", title: "行内代码", action: () => toggleInlineCode() },
+      { label: "链接", title: "链接 (Ctrl+K)", action: () => insertLink() },
+    ] });
+  }
+  const headingItems = [];
+  for (let level = 1; level <= 6; level += 1) {
+    headingItems.push({ label: "标题 " + level, shortcut: "Ctrl+" + level, checked: block?.tagName === "H" + level, action: () => applyHeading(level) });
+  }
+  headingItems.push("-", { label: "正文", shortcut: "Ctrl+0", checked: block?.tagName === "P", action: () => applyHeading(0) });
+  items.push(
+    "-",
+    { label: "段落", children: headingItems },
+    { label: "引用", shortcut: "Ctrl+Shift+Q", checked: Boolean(closest("blockquote")), action: () => toggleBlockquote() },
+    { label: "有序列表", shortcut: "Ctrl+Shift+[", checked: Boolean(closest("ol")), action: () => { editor.focus(); document.execCommand("insertOrderedList"); updateAfterEdit(); } },
+    { label: "无序列表", shortcut: "Ctrl+Shift+]", checked: Boolean(closest("ul:not(.task-list)")) && !closest("li > input[type=checkbox]") && !closest("ul"), action: () => { editor.focus(); document.execCommand("insertUnorderedList"); updateAfterEdit(); } },
+    { label: "任务列表", checked: Boolean(closest("li")?.querySelector(":scope > input[type=checkbox]")), action: () => toggleTaskList() },
+  );
+  if (listItem) {
+    items.push(
+      { label: "减少缩进", shortcut: "Shift+Tab", action: () => indentList(true) },
+      { label: "增加缩进", shortcut: "Tab", action: () => indentList(false) },
+    );
+  }
+  items.push("-", { label: "插入", children: [
+    { label: "图片", shortcut: "Ctrl+Shift+I", action: () => void insertImage() },
+    { label: "表格", shortcut: "Ctrl+T", action: () => insertTable() },
+    { label: "代码块", shortcut: "Ctrl+Shift+K", action: () => insertCodeBlock() },
+    { label: "数学块", action: () => insertMathBlock() },
+    { label: "水平分割线", action: () => insertHorizontalRule() },
+  ] });
+  if (inTable) {
+    items.push("-", { label: "表格", children: buildTableMenuItems() });
+  }
+  if (pre && !inTable) items.push("-", { label: "复制代码内容", action: () => void copyCodeContent() });
+  if (link) {
+    items.push(
+      "-",
+      { label: "打开链接", action: () => openContextLink() },
+      { label: "复制链接地址", action: () => void copyContextLinkAddress() },
+    );
+  }
+  if (image) {
+    items.push(
+      "-",
+      { label: "复制图片", action: () => void copyImageContent() },
+      { label: "复制图片为 Markdown", action: () => void copyImageAsMarkdown() },
+    );
+  }
+  if (math) items.push("-", { label: "复制公式源码", action: () => void copyMathSource() });
+  if (diagram) items.push("-", { label: "复制图表源码", action: () => void copyDiagramSource() });
+  const deleteLabel = blockDeleteLabel(block);
+  if (deleteLabel && !inTable) items.push("-", { label: "删除" + deleteLabel, destructive: true, action: () => deleteActiveBlock() });
+  return items;
+}
+
 function performAction(action, item) {
   closeMenus();
   switch (action) {
@@ -902,7 +2366,7 @@ function performAction(action, item) {
     case "unordered-list": document.execCommand("insertUnorderedList"); break;
     case "ordered-list": document.execCommand("insertOrderedList"); break;
     case "quote": document.execCommand("formatBlock", false, "BLOCKQUOTE"); break;
-    case "code-block": document.execCommand("insertHTML", false, "<pre><code><br></code></pre>"); break;
+    case "code-block": insertCodeBlock(); break;
     case "table": insertTable(); break;
     case "find": showFindbar(false); break;
     case "replace": showFindbar(true); break;
@@ -1096,7 +2560,12 @@ function updateAfterEdit() {
   scheduleRecoveryDraft();
   const empty = editor.childNodes.length === 0 || (editor.childNodes.length === 1 && !editor.textContent.trim());
   editor.classList.toggle("is-empty", empty);
-  if (typewriterMode && preferences.typewriterCenter) activeBlock()?.scrollIntoView({ behavior: "smooth", block: "center" });
+  const editedBlock = activeBlock();
+  if (editedBlock?.tagName === "PRE") {
+    updateCodeGutter(editedBlock);
+    scheduleCodeRehighlight(editedBlock.querySelector("code"));
+  }
+  if (typewriterMode && preferences.typewriterCenter) editedBlock?.scrollIntoView({ behavior: "smooth", block: "center" });
 }
 
 function scheduleRecoveryDraft() {
@@ -1120,9 +2589,8 @@ async function restoreRecoveryDraft() {
       await invoke("clear_recovery_draft");
       return;
     }
-    activePath = draft.path || null;
+    activePath = draft.path ? normalizeTreePath(draft.path) : null;
     activeLineEnding = draft.lineEnding || "lf";
-    folderPath = activePath ? activePath.replace(/[\\/][^\\/]+$/, "") : null;
     sourceMode = false;
     source.hidden = true;
     editor.hidden = false;
@@ -1132,10 +2600,10 @@ async function restoreRecoveryDraft() {
     await renderMarkdown(markdown);
     savedMarkdown = "\u0000recovered-draft";
     setDirty(true);
-    if (folderPath) {
+    if (activePath) {
       activePanel = "files";
       showSidebar("files");
-      await refreshFolder(folderPath);
+      await revealFileInTree(activePath);
     }
     editor.focus();
     placeCaretAtEnd(editor.lastElementChild || editor);
@@ -1204,8 +2672,10 @@ document.querySelectorAll("[data-theme]").forEach((button) => {
 });
 
 document.addEventListener("click", (event) => {
-  if (!event.target.closest(".app-menu")) closeMenus();
+  if (!event.target.closest?.(".app-menu")) closeMenus();
+  if (!event.target.closest?.("#file-context-menu")) closeContextMenu();
 });
+document.addEventListener("contextmenu", () => closeContextMenu(), true);
 
 document.querySelectorAll(".sidebar-tab").forEach((tab) => {
   tab.addEventListener("click", () => {
@@ -1213,7 +2683,8 @@ document.querySelectorAll(".sidebar-tab").forEach((tab) => {
     document.querySelectorAll(".sidebar-tab").forEach((other) => other.classList.toggle("selected", other === tab));
     document.querySelector("#outline-panel").hidden = activePanel !== "outline";
     document.querySelector("#files-panel").hidden = activePanel !== "files";
-    if (activePanel === "files" && folderPath) void refreshFolder(folderPath);
+    if (activePanel === "files" && folderRoot) void reloadDirectory(folderRoot);
+    if (activePanel === "outline") syncActiveOutlineItem();
   });
 });
 
@@ -1221,7 +2692,8 @@ document.querySelector("#close-sidebar").addEventListener("click", () => { sideb
 document.querySelector("#toggle-sidebar").addEventListener("click", () => toggleSidebar());
 document.querySelector("#toggle-source").addEventListener("click", () => { void toggleSourceMode(); });
 document.querySelector("#word-count").addEventListener("click", () => performAction("word-count"));
-document.querySelector("#open-folder").addEventListener("click", chooseFolder);
+bindTreeEvents();
+window.__TAURI__?.event?.listen("fs-change", (event) => queueFsChanges(Array.isArray(event?.payload) ? event.payload : []));
 document.querySelector("#find-close").addEventListener("click", () => { findbar.hidden = true; editor.focus(); });
 document.querySelector("#find-next").addEventListener("click", () => findNext(false));
 document.querySelector("#find-prev").addEventListener("click", () => findNext(true));
@@ -1241,10 +2713,54 @@ findInput.addEventListener("keydown", (event) => {
 });
 
 editor.addEventListener("input", updateAfterEdit);
+editor.addEventListener("compositionstart", () => { codeComposing = true; });
+editor.addEventListener("compositionend", () => {
+  codeComposing = false;
+  const block = activeBlock();
+  if (block?.tagName === "PRE") scheduleCodeRehighlight(block.querySelector("code"));
+});
+editor.addEventListener("mousedown", (event) => {
+  if (event.button === 2) {
+    const selection = window.getSelection();
+    if (selection && !selection.isCollapsed) event.preventDefault();
+  }
+});
+editor.addEventListener("click", (event) => {
+  const link = event.target.closest?.("a[href]");
+  if (!link || !editor.contains(link)) return;
+  event.preventDefault();
+  if (event.ctrlKey || event.metaKey) openLinkUrl(link.getAttribute("href"));
+});
+editor.addEventListener("contextmenu", (event) => {
+  if (sourceMode) return;
+  event.preventDefault();
+  if (editor.getAttribute("aria-busy") === "true") return;
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed) collapseCaretToClick(event);
+  const clickedCell = event.target.closest?.("td,th");
+  activeTableCell = clickedCell && editor.contains(clickedCell) ? clickedCell : null;
+  const items = buildEditorContextMenu(event.target);
+  if (items.length) openContextMenu(event.clientX, event.clientY, items);
+});
 source.addEventListener("input", updateAfterEdit);
 
 editor.addEventListener("keydown", (event) => {
-  if (!sourceMode && preferences.autoPair && !event.ctrlKey && !event.metaKey && !event.altKey) {
+  const codeBlock = (() => {
+    if (sourceMode || activeTableCell) return null;
+    const anchor = window.getSelection()?.anchorNode;
+    const element = anchor?.nodeType === Node.TEXT_NODE ? anchor.parentElement : anchor;
+    const code = element?.closest?.("pre code");
+    return code && editor.contains(code) ? code : null;
+  })();
+  if (event.key === "`" && !event.ctrlKey && !event.metaKey && !event.altKey && !codeBlock) {
+    const block = activeBlock();
+    if (block?.tagName === "P" && (block.innerText || "").trim() === "``") {
+      event.preventDefault();
+      createCodeBlockFromParagraph(block);
+      return;
+    }
+  }
+  if (!sourceMode && preferences.autoPair && !event.ctrlKey && !event.metaKey && !event.altKey && !(codeBlock && event.key === "`")) {
     const selection = window.getSelection();
     const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
     if (range && Object.values(typingPairs).includes(event.key) && !range.collapsed && range.toString() === "") return;
@@ -1283,6 +2799,18 @@ editor.addEventListener("keydown", (event) => {
     editActiveTable("add-row");
     return;
   }
+  if (activeTableCell && !sourceMode) {
+    if (event.altKey && event.key.startsWith("Arrow")) {
+      event.preventDefault();
+      editActiveTable({ ArrowUp: "move-row-up", ArrowDown: "move-row-down", ArrowLeft: "move-col-left", ArrowRight: "move-col-right" }[event.key]);
+      return;
+    }
+    if (event.ctrlKey && event.shiftKey && event.key === "Backspace") {
+      event.preventDefault();
+      editActiveTable("delete-row");
+      return;
+    }
+  }
   if (event.key === "Tab" && activeTableCell) {
     const cells = [...activeTableCell.closest("table").querySelectorAll("td,th")];
     const index = cells.indexOf(activeTableCell);
@@ -1298,6 +2826,51 @@ editor.addEventListener("keydown", (event) => {
       event.preventDefault();
       focusTableCell(target);
       return;
+    }
+  }
+  if (codeBlock) {
+    if (event.key === "Enter" && !event.ctrlKey && !event.metaKey) {
+      // Chromium routes Enter to paragraph splitting, which ejects the caret
+      // from the code block; splice the newline into the text directly.
+      event.preventDefault();
+      const selection = window.getSelection();
+      const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+      if (!range) return;
+      if (!range.collapsed) range.deleteContents();
+      const offset = codeAbsoluteOffset(codeBlock, range.startContainer, range.startOffset);
+      if (offset == null) return;
+      const text = codeLogicalText(codeBlock);
+      setCodeText(codeBlock, text.slice(0, offset) + "\n" + text.slice(offset));
+      rehighlightCode(codeBlock);
+      placeCaretInCode(codeBlock, offset + 1);
+      updateAfterEdit();
+      return;
+    }
+    if (event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
+      event.preventDefault();
+      moveCodeLine(codeBlock, event.key === "ArrowUp" ? -1 : 1);
+      return;
+    }
+    if ((event.key === "ArrowUp" || event.key === "ArrowDown") && !event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey) {
+      const selection = window.getSelection();
+      const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+      if (range?.collapsed) {
+        const offset = codeAbsoluteOffset(codeBlock, range.startContainer, range.startOffset);
+        if (offset != null) {
+          const text = codeLogicalText(codeBlock);
+          const position = lineColOfText(text, offset);
+          if (event.key === "ArrowUp" && position.line === 0) {
+            event.preventDefault();
+            exitCodeBlock(codeBlock, "up");
+            return;
+          }
+          if (event.key === "ArrowDown" && position.line >= text.split("\n").length - 1) {
+            event.preventDefault();
+            exitCodeBlock(codeBlock, "down");
+            return;
+          }
+        }
+      }
     }
   }
   const block = activeBlock();
@@ -1321,29 +2894,39 @@ document.addEventListener("selectionchange", () => {
   if (block) block.classList.add("active-block");
   const node = window.getSelection()?.anchorNode;
   const element = node?.nodeType === Node.TEXT_NODE ? node.parentElement : node;
-  if (element && editor.contains(element)) {
-    activeTableCell = element.closest("td,th");
-    positionTableToolbar();
-  }
+  activeTableCell = element && editor.contains(element) ? element.closest("td,th") : null;
+  positionTableMoreButton();
+  const langPre = currentCodeBlock();
+  if (langPre) showCodeLangTooltip(langPre);
+  else if (!langEditing) { activeLangPre = null; hideCodeLangTooltip(); }
 });
 
-function positionTableToolbar() {
-  if (!activeTableCell || sourceMode || !editor.contains(activeTableCell)) {
-    tableToolbar.hidden = true;
+function positionTableMoreButton() {
+  const table = activeTableCell?.closest("table");
+  if (!table || sourceMode || !editor.contains(table)) {
+    tableMoreButton.hidden = true;
     return;
   }
-  const bounds = activeTableCell.getBoundingClientRect();
-  tableToolbar.hidden = false;
-  tableToolbar.style.left = Math.max(8, Math.min(bounds.left, innerWidth - tableToolbar.offsetWidth - 8)) + "px";
-  tableToolbar.style.top = Math.max(34, bounds.top - tableToolbar.offsetHeight - 6) + "px";
+  const bounds = table.getBoundingClientRect();
+  tableMoreButton.hidden = false;
+  tableMoreButton.style.left = Math.max(8, bounds.right - tableMoreButton.offsetWidth) + "px";
+  tableMoreButton.style.top = Math.max(34, bounds.top - tableMoreButton.offsetHeight - 8) + "px";
 }
 
-tableToolbar.addEventListener("mousedown", (event) => event.preventDefault());
-tableToolbar.querySelectorAll("[data-table-action]").forEach((button) => {
-  button.addEventListener("click", () => editActiveTable(button.dataset.tableAction));
+tableMoreButton.addEventListener("mousedown", (event) => event.preventDefault());
+tableMoreButton.addEventListener("click", (event) => {
+  event.stopPropagation();
+  const rect = tableMoreButton.getBoundingClientRect();
+  openContextMenu(rect.right + 4, rect.top - 2, buildTableMenuItems());
 });
-document.querySelector("#main-area").addEventListener("scroll", positionTableToolbar, { passive: true });
-window.addEventListener("resize", positionTableToolbar);
+
+document.querySelector("#main-area").addEventListener("scroll", positionTableMoreButton, { passive: true });
+document.querySelector("#main-area").addEventListener("scroll", syncActiveOutlineItem, { passive: true });
+document.querySelector("#main-area").addEventListener("scroll", () => positionCodeLangTooltip(activeLangPre), { passive: true });
+document.querySelector("#main-area").addEventListener("scroll", closeContextMenu, { passive: true });
+document.querySelector("#file-library-tree").addEventListener("scroll", closeContextMenu, { passive: true });
+window.addEventListener("resize", positionTableMoreButton);
+window.addEventListener("resize", () => positionCodeLangTooltip(activeLangPre));
 
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !preferencesDialog.hidden) { closePreferences(); return; }
